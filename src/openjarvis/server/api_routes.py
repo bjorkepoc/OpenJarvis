@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import logging
@@ -305,9 +306,7 @@ async def memory_index(req: MemoryIndexRequest, request: Request):
                 for d in workspace.split(os.pathsep)
                 if d.strip()
             ]
-            if not any(
-                target == root or root in target.parents for root in roots
-            ):
+            if not any(target == root or root in target.parents for root in roots):
                 raise HTTPException(
                     status_code=403,
                     detail="Path is outside the allowed workspace directories.",
@@ -742,8 +741,11 @@ async def websocket_chat_stream(websocket: WebSocket):
                                 )
                     except TypeError:
                         # stream() didn't return an iterable; fall back to
-                        # generate()
-                        result = engine.generate(messages, model=model)
+                        # generate(). It makes a blocking upstream call, so run
+                        # it in a worker thread to keep the event loop free.
+                        result = await asyncio.to_thread(
+                            engine.generate, messages, model=model
+                        )
                         content = (
                             result.get("content", "")
                             if isinstance(
@@ -768,8 +770,11 @@ async def websocket_chat_stream(websocket: WebSocket):
                         ended_at=_time.time(),
                     )
                 else:
-                    # No stream method — single-shot generate
-                    result = engine.generate(messages, model=model)
+                    # No stream method — single-shot generate. Blocking upstream
+                    # call, so run in a worker thread to keep the event loop free.
+                    result = await asyncio.to_thread(
+                        engine.generate, messages, model=model
+                    )
                     content = (
                         result.get("content", "")
                         if isinstance(
@@ -893,7 +898,20 @@ async def transcribe_speech(request: Request):
     filename = getattr(audio_file, "filename", "audio.wav")
     ext = filename.rsplit(".", 1)[-1] if "." in filename else "wav"
 
-    result = backend.transcribe(audio_bytes, format=ext, language=language or None)
+    try:
+        result = await asyncio.to_thread(
+            backend.transcribe,
+            audio_bytes,
+            format=ext,
+            language=language or None,
+        )
+    except Exception as exc:
+        logger.exception("Speech transcription failed")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Speech transcription failed: {exc}",
+        ) from exc
+
     return {
         "text": result.text,
         "language": result.language,
@@ -908,9 +926,23 @@ async def speech_health(request: Request):
     backend = getattr(request.app.state, "speech_backend", None)
     if backend is None:
         return {"available": False, "reason": "No speech backend configured"}
+    try:
+        available = backend.health()
+        reason = None
+    except Exception as exc:
+        logger.exception("Speech health check failed")
+        available = False
+        reason = str(exc)
+
+    if not available and reason is None:
+        last_error = getattr(backend, "last_error", None)
+        if callable(last_error):
+            reason = last_error()
+
     return {
-        "available": backend.health(),
+        "available": available,
         "backend": backend.backend_id,
+        **({"reason": reason} if reason else {}),
     }
 
 

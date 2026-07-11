@@ -40,7 +40,8 @@ jobs:
             libappindicator3-dev \
             librsvg2-dev \
             patchelf \
-            libxdo-dev
+            libxdo-dev \
+            libdbus-1-dev
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -114,6 +115,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          # Full history + tags so the workflow_dispatch fallback in
+          # "Determine release info" can derive the dev version from the
+          # latest release tag (#526).
+          fetch-depth: 0
 
       - name: Install system dependencies (Linux)
         if: matrix.platform == 'ubuntu-22.04'
@@ -125,7 +131,8 @@ jobs:
             libappindicator3-dev \
             librsvg2-dev \
             patchelf \
-            libxdo-dev
+            libxdo-dev \
+            libdbus-1-dev
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -183,7 +190,16 @@ jobs:
             # workflow_dispatch fallback (manual UI dispatch without --ref).
             # Derive a PEP 440 dev version aligned with autotag.yml so we
             # don't burn the X.Y.Z release-version namespace.
-            BASE=$(grep -E '^version = "' pyproject.toml | head -1 | sed -E 's/^version = "([^"]+)"/\1/')
+            # pyproject.toml no longer carries a static version (#526), so the
+            # base comes from the latest plain release tag (vX.Y.Z), matching
+            # autotag.yml. .dev/.rc/desktop-* tags are excluded.
+            LATEST_RELEASE=$(git tag --list 'v[0-9]*' --merged HEAD \
+              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+            if [[ -z "$LATEST_RELEASE" ]]; then
+              echo "::error::No release tag (vX.Y.Z) reachable from HEAD"
+              exit 1
+            fi
+            BASE="${LATEST_RELEASE#v}"
             MAJOR=$(echo "$BASE" | cut -d. -f1)
             MINOR=$(echo "$BASE" | cut -d. -f2)
             PATCH=$(echo "$BASE" | cut -d. -f3 | sed -E 's/[^0-9].*$//')
@@ -238,6 +254,10 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           TAURI_CONFIG: '{"version":"${{ steps.release-info.outputs.tauri_version }}","bundle":{"externalBin":["binaries/ollama"]}}'
+          # tauri-action runs beforeBuildCommand (npm run build:tauri -> vite
+          # build), which requires this at build time (#587). Strict for
+          # releases: a missing/empty secret fails the build by design.
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
         with:
           projectPath: frontend
           tauriScript: npx tauri

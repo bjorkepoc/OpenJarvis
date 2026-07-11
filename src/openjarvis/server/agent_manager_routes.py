@@ -2095,10 +2095,13 @@ def create_agent_manager_router(
             raise HTTPException(status_code=404, detail="Agent not found")
         try:
             from openjarvis.core.config import load_config
+            from openjarvis.core.paths import get_config_dir
             from openjarvis.traces.store import TraceStore
 
             config = load_config()
-            store = TraceStore(config.traces.db_path or "~/.openjarvis/traces.db")
+            store = TraceStore(
+                config.traces.db_path or str(get_config_dir() / "traces.db")
+            )
             traces = store.list_traces(agent=agent_id, limit=limit)
             return {
                 "traces": [
@@ -2120,10 +2123,13 @@ def create_agent_manager_router(
     def get_trace(agent_id: str, trace_id: str):
         try:
             from openjarvis.core.config import load_config
+            from openjarvis.core.paths import get_config_dir
             from openjarvis.traces.store import TraceStore
 
             config = load_config()
-            store = TraceStore(config.traces.db_path or "~/.openjarvis/traces.db")
+            store = TraceStore(
+                config.traces.db_path or str(get_config_dir() / "traces.db")
+            )
             trace = store.get(trace_id)
             if trace is None:
                 raise HTTPException(status_code=404, detail="Trace not found")
@@ -2257,14 +2263,14 @@ def create_agent_manager_router(
         import httpx
 
         try:
-            resp = httpx.get(
-                "https://api.sendblue.co/api/lines",
-                headers={
-                    "sb-api-key-id": api_key_id,
-                    "sb-api-secret-key": api_secret_key,
-                },
-                timeout=15.0,
-            )
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(
+                    "https://api.sendblue.co/api/lines",
+                    headers={
+                        "sb-api-key-id": api_key_id,
+                        "sb-api-secret-key": api_secret_key,
+                    },
+                )
             if resp.status_code == 401:
                 raise HTTPException(
                     status_code=401,
@@ -2284,12 +2290,16 @@ def create_agent_manager_router(
             )
             numbers = []
             for line in lines:
-                num = (
-                    line.get("number")
-                    or line.get("phone_number")
-                    or line.get("from_number")
-                    or (line if isinstance(line, str) else "")
-                )
+                if isinstance(line, str):
+                    num = line
+                elif isinstance(line, dict):
+                    num = (
+                        line.get("number")
+                        or line.get("phone_number")
+                        or line.get("from_number")
+                    )
+                else:
+                    num = None
                 if num:
                     numbers.append(num)
             return {
@@ -2321,18 +2331,18 @@ def create_agent_manager_router(
         import httpx
 
         try:
-            resp = httpx.post(
-                "https://api.sendblue.co/api/account/webhooks",
-                headers={
-                    "sb-api-key-id": api_key_id,
-                    "sb-api-secret-key": api_secret_key,
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "receive": webhook_url,
-                },
-                timeout=15.0,
-            )
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(
+                    "https://api.sendblue.co/api/account/webhooks",
+                    headers={
+                        "sb-api-key-id": api_key_id,
+                        "sb-api-secret-key": api_secret_key,
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "receive": webhook_url,
+                    },
+                )
             return {
                 "registered": resp.status_code < 300,
                 "status": resp.status_code,
@@ -2372,16 +2382,16 @@ def create_agent_manager_router(
             if from_number:
                 payload["from_number"] = from_number
 
-            resp = httpx.post(
-                "https://api.sendblue.co/api/send-message",
-                headers={
-                    "sb-api-key-id": api_key_id,
-                    "sb-api-secret-key": api_secret_key,
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-                timeout=15.0,
-            )
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(
+                    "https://api.sendblue.co/api/send-message",
+                    headers={
+                        "sb-api-key-id": api_key_id,
+                        "sb-api-secret-key": api_secret_key,
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                )
             return {
                 "sent": resp.status_code < 300,
                 "status": resp.status_code,
