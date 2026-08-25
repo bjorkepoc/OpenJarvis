@@ -101,6 +101,7 @@ _DEEPSEEK_MODELS = [
 
 # OpenRouter models — prefixed with "openrouter/" so they can be identified
 _OPENROUTER_POPULAR = [
+    "openrouter/stealth/ox-alpha",
     "openrouter/auto",
     "openrouter/openai/gpt-4o",
     "openrouter/anthropic/claude-sonnet-4",

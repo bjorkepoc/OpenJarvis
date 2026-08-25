@@ -59,6 +59,11 @@ class TestCloudEngineListModels:
         engine = CloudEngine()
         assert engine.list_models() == []
 
+    def test_list_models_includes_ox_alpha_with_openrouter(self) -> None:
+        engine = CloudEngine()
+        engine._openrouter_client = mock.MagicMock()
+        assert "openrouter/stealth/ox-alpha" in engine.list_models()
+
 
 class TestCloudEngineGenerate:
     def test_generate_openai(self, monkeypatch: pytest.MonkeyPatch) -> None:

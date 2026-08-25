@@ -2415,6 +2415,7 @@ mod native_overlay {
                 "GEMINI_API_KEY" | "GOOGLE_API_KEY" => {
                     models.extend(["gemini-2.5-flash", "gemini-2.5-pro"])
                 }
+                "OPENROUTER_API_KEY" => models.push("openrouter/stealth/ox-alpha"),
                 _ => {}
             }
         }
