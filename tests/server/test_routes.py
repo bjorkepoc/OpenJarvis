@@ -1570,10 +1570,16 @@ class TestModelsEndpoint:
         async def direct_cloud_tokens():
             yield "wrong backend"
 
-        with patch(
-            "openjarvis.server.cloud_router.stream_cloud",
-            return_value=direct_cloud_tokens(),
-        ) as stream_cloud:
+        with (
+            patch(
+                "openjarvis.server.routes._ox_cloud_route_available",
+                return_value=True,
+            ),
+            patch(
+                "openjarvis.server.cloud_router.stream_cloud",
+                return_value=direct_cloud_tokens(),
+            ) as stream_cloud,
+        ):
             client = TestClient(app)
             resp = client.post(
                 "/v1/chat/completions",
@@ -1588,6 +1594,40 @@ class TestModelsEndpoint:
         stream_cloud.assert_not_called()
         assert "Hello" in resp.text
         agent.run.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "model", ["openrouter/stealth/ox-alpha", "stealth/ox-alpha"]
+    )
+    def test_ox_rejects_local_only_engine(self, model):
+        engine = _make_engine(models=[model])
+        app = create_app(engine, model, engine_name="ollama", config=_test_config())
+
+        resp = TestClient(app).post(
+            "/v1/chat/completions",
+            json={
+                "model": model,
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+
+        assert resp.status_code == 503
+        engine.generate.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "model", ["openrouter/stealth/ox-alpha", "stealth/ox-alpha"]
+    )
+    def test_ox_cloud_route_is_found_through_wrappers(self, model):
+        from openjarvis.engine.cloud import CloudEngine
+        from openjarvis.engine.multi import MultiEngine
+        from openjarvis.security.guardrails import GuardrailsEngine
+        from openjarvis.server.routes import _ox_cloud_route_available
+        from openjarvis.telemetry.instrumented_engine import InstrumentedEngine
+
+        cloud = CloudEngine.__new__(CloudEngine)
+        cloud._openrouter_client = object()
+        routed = MultiEngine([("cloud", InstrumentedEngine(cloud, EventBus()))])
+
+        assert _ox_cloud_route_available(GuardrailsEngine(routed, scanners=[]), model)
 
     def test_cloud_reload_preserves_guardrail_wrapper(self, monkeypatch):
         from openjarvis.engine.multi import MultiEngine
@@ -1668,6 +1708,40 @@ class TestModelsEndpoint:
         for model in ("openrouter/stealth/ox-alpha", "stealth/ox-alpha"):
             with pytest.raises(ValueError):
                 multi._engine_for(model)
+
+    def test_cloud_reload_preserves_cloud_wrapper_and_model_precedence(
+        self, monkeypatch
+    ):
+        from openjarvis.engine.cloud import CloudEngine
+        from openjarvis.engine.multi import MultiEngine
+        from openjarvis.security.guardrails import GuardrailsEngine
+        from openjarvis.telemetry.instrumented_engine import InstrumentedEngine
+
+        _clear_cloud_keys(monkeypatch)
+        monkeypatch.setenv("OPENROUTER_API_KEY", "old-key")
+        old_cloud = CloudEngine()
+        instrumented = InstrumentedEngine(old_cloud, EventBus())
+        local = _make_engine(models=["openrouter/auto"])
+        multi = MultiEngine([("cloud", instrumented), ("local", local)])
+        guarded = GuardrailsEngine(multi, scanners=[])
+        app = create_app(
+            guarded,
+            "openrouter/stealth/ox-alpha",
+            engine_name="multi",
+            config=_test_config(),
+        )
+
+        resp = TestClient(app).post(
+            "/v1/cloud/reload",
+            json={"keys": {"OPENROUTER_API_KEY": "new-key"}},
+        )
+
+        assert resp.json()["status"] == "ok"
+        assert multi._engines[0] == ("cloud", instrumented)
+        assert isinstance(instrumented._inner, CloudEngine)
+        assert instrumented._inner is not old_cloud
+        assert multi._engine_for("openrouter/auto") is local
+        assert old_cloud._openrouter_client is None
 
 
 # ---------------------------------------------------------------------------

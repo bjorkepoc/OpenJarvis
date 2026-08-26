@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import threading
 from types import SimpleNamespace
 from unittest import mock
@@ -588,6 +589,9 @@ class TestOxAlphaFreeRouting:
         ]
 
         self._assert_free_policy(client)
+        assert client.chat.completions.create.call_args.kwargs["stream_options"] == {
+            "include_usage": True
+        }
         assert result == ["ok"]
 
     @pytest.mark.asyncio
@@ -653,6 +657,9 @@ class TestOxAlphaFreeRouting:
         ]
 
         self._assert_free_policy(client)
+        assert client.chat.completions.create.call_args.kwargs["stream_options"] == {
+            "include_usage": True
+        }
         assert result[0].content == "ok"
         assert result[-1].usage == {
             "prompt_tokens": 3,
@@ -682,6 +689,41 @@ class TestOxAlphaFreeRouting:
 
         assert result[0].content == "ok"
         assert worker_threads and worker_threads[0] != caller_thread
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("full", [False, True])
+    async def test_cancelling_stream_closes_provider_response(self, full: bool) -> None:
+        entered = threading.Event()
+        closed = threading.Event()
+
+        class BlockingStream:
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                entered.set()
+                closed.wait(timeout=5)
+                raise StopIteration
+
+            def close(self):
+                closed.set()
+
+        engine, client = self._engine(BlockingStream())
+        messages = [Message(role=Role.USER, content="Hi")]
+        stream = (
+            engine.stream_full(messages, model="openrouter/stealth/ox-alpha")
+            if full
+            else engine.stream(messages, model="openrouter/stealth/ox-alpha")
+        )
+        task = asyncio.create_task(anext(stream))
+        assert await asyncio.to_thread(entered.wait, 1)
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert closed.wait(timeout=1)
+        client.chat.completions.create.assert_called_once()
 
 
 class TestCloudEngineCanServe:

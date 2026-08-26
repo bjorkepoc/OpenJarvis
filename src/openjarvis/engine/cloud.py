@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import os
+import threading
 import time
 import uuid
 from collections.abc import AsyncIterator, Sequence
@@ -184,6 +185,15 @@ def _validate_ox_alpha_response(model: str, response_model: Any, usage: Any) -> 
             f"OpenRouter returned non-zero or invalid Ox Alpha cost: {cost!r}"
         )
     return float(cost)
+
+
+def _close_stream_response(response: Any) -> None:
+    close = getattr(response, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            logger.debug("Failed to close cancelled cloud stream", exc_info=True)
 
 
 def _is_codex_model(model: str) -> bool:
@@ -1546,6 +1556,8 @@ class CloudEngine(InferenceEngine):
             "stream": True,
         }
         create_kwargs.update(_ox_alpha_request_options(model))
+        if _is_ox_alpha_model(model):
+            create_kwargs["stream_options"] = {"include_usage": True}
         # Forward tools / tool_choice (OpenRouter is OpenAI-compatible).
         tools = kwargs.pop("tools", None)
         if tools:
@@ -1555,23 +1567,41 @@ class CloudEngine(InferenceEngine):
             create_kwargs["tool_choice"] = tool_choice
 
         if _is_ox_alpha_model(model):
+            cancelled = threading.Event()
+            responses: List[Any] = []
 
             def collect() -> List[str]:
                 resp = self._openrouter_client.chat.completions.create(**create_kwargs)
+                responses.append(resp)
+                if cancelled.is_set():
+                    _close_stream_response(resp)
+                    return []
                 response_model: Any = None
                 final_usage: Any = None
                 pending: List[str] = []
-                for chunk in resp:
-                    response_model = getattr(chunk, "model", response_model)
-                    final_usage = getattr(chunk, "usage", None) or final_usage
-                    _validate_ox_alpha_model(model, response_model)
-                    delta = chunk.choices[0].delta if chunk.choices else None
-                    if delta and delta.content:
-                        pending.append(delta.content)
-                _validate_ox_alpha_response(model, response_model, final_usage)
-                return pending
+                try:
+                    for chunk in resp:
+                        if cancelled.is_set():
+                            return []
+                        response_model = getattr(chunk, "model", response_model)
+                        final_usage = getattr(chunk, "usage", None) or final_usage
+                        _validate_ox_alpha_model(model, response_model)
+                        delta = chunk.choices[0].delta if chunk.choices else None
+                        if delta and delta.content:
+                            pending.append(delta.content)
+                    _validate_ox_alpha_response(model, response_model, final_usage)
+                    return pending
+                finally:
+                    _close_stream_response(resp)
 
-            for token in await asyncio.to_thread(collect):
+            try:
+                pending = await asyncio.to_thread(collect)
+            except asyncio.CancelledError:
+                cancelled.set()
+                if responses:
+                    _close_stream_response(responses[0])
+                raise
+            for token in pending:
                 yield token
             return
 
@@ -1671,6 +1701,8 @@ class CloudEngine(InferenceEngine):
                 **kwargs,
             }
             create_kwargs.update(_ox_alpha_request_options(model))
+            if _is_ox_alpha_model(model):
+                create_kwargs["stream_options"] = {"include_usage": True}
         elif _is_minimax_model(model):
             client = self._minimax_client
             if client is None:
@@ -1741,36 +1773,53 @@ class CloudEngine(InferenceEngine):
             return None
 
         if _is_ox_alpha_model(model):
+            cancelled = threading.Event()
+            responses: List[Any] = []
 
             def collect() -> tuple[List[StreamChunk], Dict[str, Any]]:
                 resp = client.chat.completions.create(**create_kwargs)
+                responses.append(resp)
+                if cancelled.is_set():
+                    _close_stream_response(resp)
+                    return [], {}
                 response_model: Any = None
                 final_usage: Any = None
                 pending: List[StreamChunk] = []
-                for chunk in resp:
-                    response_model = getattr(chunk, "model", response_model)
-                    final_usage = getattr(chunk, "usage", None) or final_usage
-                    _validate_ox_alpha_model(model, response_model)
-                    choice = chunk.choices[0] if chunk.choices else None
-                    stream_chunk = convert_choice(choice)
-                    if stream_chunk is not None:
-                        pending.append(stream_chunk)
-                _validate_ox_alpha_response(model, response_model, final_usage)
-                usage = {
-                    name: (
-                        final_usage.get(name, 0)
-                        if isinstance(final_usage, dict)
-                        else getattr(final_usage, name, 0)
-                    )
-                    for name in (
-                        "prompt_tokens",
-                        "completion_tokens",
-                        "total_tokens",
-                    )
-                }
-                return pending, usage
+                try:
+                    for chunk in resp:
+                        if cancelled.is_set():
+                            return [], {}
+                        response_model = getattr(chunk, "model", response_model)
+                        final_usage = getattr(chunk, "usage", None) or final_usage
+                        _validate_ox_alpha_model(model, response_model)
+                        choice = chunk.choices[0] if chunk.choices else None
+                        stream_chunk = convert_choice(choice)
+                        if stream_chunk is not None:
+                            pending.append(stream_chunk)
+                    _validate_ox_alpha_response(model, response_model, final_usage)
+                    usage = {
+                        name: (
+                            final_usage.get(name, 0)
+                            if isinstance(final_usage, dict)
+                            else getattr(final_usage, name, 0)
+                        )
+                        for name in (
+                            "prompt_tokens",
+                            "completion_tokens",
+                            "total_tokens",
+                        )
+                    }
+                    return pending, usage
+                finally:
+                    _close_stream_response(resp)
 
-            pending, usage = await asyncio.to_thread(collect)
+            try:
+                pending, usage = await asyncio.to_thread(collect)
+            except asyncio.CancelledError:
+                cancelled.set()
+                if responses:
+                    _close_stream_response(responses[0])
+                raise
             for stream_chunk in pending:
                 yield stream_chunk
             yield StreamChunk(usage=usage)

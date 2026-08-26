@@ -300,6 +300,17 @@ def serve(
             "For MLX: start the MLX OpenAI-compatible server on the configured host."
         )
         sys.exit(1)
+    from openjarvis.engine.cloud import _is_ox_alpha_model
+    from openjarvis.server.routes import _ox_cloud_route_available
+
+    if _is_ox_alpha_model(model_name) and not _ox_cloud_route_available(
+        engine, model_name
+    ):
+        console.print(
+            "[red]Ox Alpha requires a configured OpenRouter cloud engine; "
+            "no model fallback was selected.[/red]"
+        )
+        sys.exit(1)
 
     # Resolve agent
     agent = None

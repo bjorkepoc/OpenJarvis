@@ -130,6 +130,7 @@ async def test_direct_ox_stream_enforces_free_private_route(
             "image": 0,
         },
     }
+    assert captured["payload"]["stream_options"] == {"include_usage": True}
 
 
 @pytest.mark.asyncio

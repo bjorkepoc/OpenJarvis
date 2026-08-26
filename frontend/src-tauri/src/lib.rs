@@ -2101,29 +2101,79 @@ fn read_cloud_keys() -> Vec<(String, String)> {
         .collect()
 }
 
-async fn reload_cloud_keys(keys: Vec<(String, String)>) {
+fn validate_cloud_reload_response(
+    body: &serde_json::Value,
+    removing: bool,
+) -> Result<(), String> {
+    let status = body.get("status").and_then(|value| value.as_str());
+    if status == Some("ok") || (removing && status == Some("no_cloud")) {
+        return Ok(());
+    }
+    Err(body
+        .get("message")
+        .and_then(|value| value.as_str())
+        .unwrap_or("Cloud engine reload was not confirmed")
+        .to_string())
+}
+
+async fn reload_cloud_keys(keys: Vec<(String, String)>) -> Result<(), String> {
     let reload_url = format!("http://127.0.0.1:{}/v1/cloud/reload", JARVIS_PORT);
+    let removing = keys.iter().all(|(_, value)| value.is_empty());
     let key_map: serde_json::Map<String, serde_json::Value> = keys
         .into_iter()
         .map(|(key, value)| (key, serde_json::Value::String(value)))
         .collect();
-    let _ = reqwest::Client::new()
+    let response = reqwest::Client::new()
         .post(&reload_url)
         .json(&serde_json::json!({ "keys": key_map }))
         .timeout(std::time::Duration::from_secs(10))
         .send()
-        .await;
+        .await
+        .map_err(|error| format!("Cloud engine reload failed: {}", error))?;
+    let http_status = response.status();
+    if !http_status.is_success() {
+        return Err(format!("Cloud engine reload returned HTTP {}", http_status));
+    }
+    let body = response
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|error| format!("Cloud engine reload returned invalid JSON: {}", error))?;
+    validate_cloud_reload_response(&body, removing)
 }
 
 /// Save a single cloud API key to secure desktop storage.
 #[tauri::command]
-async fn save_cloud_key(key_name: String, key_value: String) -> Result<(), String> {
+async fn save_cloud_key(
+    key_name: String,
+    key_value: String,
+    backend: tauri::State<'_, SharedBackend>,
+) -> Result<(), String> {
+    save_cloud_key_inner(key_name, key_value, backend.inner()).await
+}
+
+async fn save_cloud_key_inner(
+    key_name: String,
+    key_value: String,
+    backend: &SharedBackend,
+) -> Result<(), String> {
     let key_value = key_value.trim().to_string();
     secure_store_set(&key_name, &key_value)?;
 
+    // During first-run setup the server has not started yet, so there is no
+    // in-memory credential to revoke or rotate. Boot reads the secure store.
+    if backend.lock().await.jarvis.is_none() {
+        return Ok(());
+    }
+
     // Tell the running server to hot-reload its cloud engine so the user
     // doesn't need to restart the app after entering an API key.
-    reload_cloud_keys(vec![(key_name, key_value)]).await;
+    if let Err(error) = reload_cloud_keys(vec![(key_name, key_value)]).await {
+        backend.lock().await.stop_all().await;
+        return Err(format!(
+            "{}; backend stopped to prevent use of stale credentials",
+            error
+        ));
+    }
 
     Ok(())
 }
@@ -2158,6 +2208,7 @@ async fn set_inference_source(
     host: Option<String>,
     engine: Option<String>,
     api_key: Option<String>,
+    backend: tauri::State<'_, SharedBackend>,
 ) -> Result<(), String> {
     let kind = match kind.as_str() {
         "ollama" => SourceKind::Ollama,
@@ -2186,7 +2237,7 @@ async fn set_inference_source(
             // Save the key before persisting the config: if the key can't be
             // written, surface it and DON'T record a custom source whose
             // credential is missing (which would fail confusingly at runtime).
-            save_cloud_key(key_name, key)
+            save_cloud_key_inner(key_name, key, backend.inner())
                 .await
                 .map_err(|e| format!("Could not store the API key: {}", e))?;
         }
@@ -2874,9 +2925,29 @@ mod tests {
         format_uv_sync_spawn_error, matching_installed_model, model_names_match, normalize_host,
         parse_inference_config, parse_ollama_model_names, preferred_installed_model,
         should_persist_resolved_model, startup_installed_model, upsert_engine_host,
-        uv_sync_stderr_tail, InferenceConfig, SourceKind, DESKTOP_UV_SYNC_COMMAND,
+        uv_sync_stderr_tail, validate_cloud_reload_response, InferenceConfig, SourceKind,
+        DESKTOP_UV_SYNC_COMMAND,
     };
     use std::path::Path;
+
+    #[test]
+    fn cloud_reload_requires_confirmed_status() {
+        assert!(validate_cloud_reload_response(
+            &serde_json::json!({"status": "ok"}),
+            false,
+        )
+        .is_ok());
+        assert!(validate_cloud_reload_response(
+            &serde_json::json!({"status": "no_cloud"}),
+            true,
+        )
+        .is_ok());
+        assert!(validate_cloud_reload_response(
+            &serde_json::json!({"status": "error", "message": "failed"}),
+            false,
+        )
+        .is_err());
+    }
 
     #[test]
     fn tail_returns_whole_string_when_shorter_than_limit() {

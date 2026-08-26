@@ -179,6 +179,7 @@ async def _stream_openai(
     is_ox_alpha = requested_model in (_OX_ALPHA_MODEL, _OX_ALPHA_API_MODEL)
     if is_ox_alpha:
         payload["provider"] = _OX_ALPHA_PROVIDER_POLICY
+        payload["stream_options"] = {"include_usage": True}
 
     async with httpx.AsyncClient(timeout=180) as client:
         async with client.stream(

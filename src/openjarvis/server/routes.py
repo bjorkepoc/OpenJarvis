@@ -163,6 +163,11 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
     model = request_body.model
     from openjarvis.engine.cloud import _is_ox_alpha_model
 
+    if _is_ox_alpha_model(model) and not _ox_cloud_route_available(engine, model):
+        raise HTTPException(
+            status_code=503,
+            detail="Ox Alpha requires a configured OpenRouter cloud engine",
+        )
     use_server_agent = (
         agent is not None
         and not _is_ox_alpha_model(model)
@@ -473,6 +478,31 @@ def _model_engine_is_instrumented(engine: Any, model: str) -> bool:
             continue
         return False
     return False
+
+
+def _ox_cloud_route_available(engine: Any, model: str) -> bool:
+    """Whether *model* resolves to a configured OpenRouter CloudEngine."""
+    from openjarvis.engine.cloud import CloudEngine, _is_ox_alpha_model
+    from openjarvis.engine.multi import MultiEngine
+    from openjarvis.security.guardrails import GuardrailsEngine
+    from openjarvis.telemetry.instrumented_engine import InstrumentedEngine
+
+    if not _is_ox_alpha_model(model):
+        return True
+    current = engine
+    while current is not None:
+        if isinstance(current, GuardrailsEngine):
+            current = current._engine
+        elif isinstance(current, InstrumentedEngine):
+            current = current._inner
+        elif isinstance(current, MultiEngine):
+            try:
+                current = current._engine_for(model)
+            except ValueError:
+                return False
+        else:
+            break
+    return isinstance(current, CloudEngine) and current._openrouter_client is not None
 
 
 def _uses_direct_cloud_router(engine: Any, model: str) -> bool:
@@ -1328,17 +1358,37 @@ async def reload_cloud_engine(request: Request):
                 "Failed to close replaced cloud engine", exc_info=True
             )
 
+    def replace_cloud_engine(route, replacement):
+        route_parent = None
+        route_parent_attr = None
+        current = route
+        while isinstance(current, (GuardrailsEngine, InstrumentedEngine)):
+            route_parent = current
+            route_parent_attr = (
+                "_engine" if isinstance(current, GuardrailsEngine) else "_inner"
+            )
+            current = getattr(current, route_parent_attr)
+        close_engine(current if isinstance(current, CloudEngine) else route)
+        if route_parent is None:
+            return replacement
+        setattr(route_parent, route_parent_attr, replacement)
+        return route
+
     if isinstance(inner, MultiEngine):
-        old_cloud = [engine for key, engine in inner._engines if key == "cloud"]
-        new_engines = [
-            (key, engine) for key, engine in inner._engines if key != "cloud"
-        ]
-        if cloud is not None:
+        new_engines = []
+        replaced = False
+        for key, engine in inner._engines:
+            if key != "cloud":
+                new_engines.append((key, engine))
+            elif cloud is not None and not replaced:
+                new_engines.append((key, replace_cloud_engine(engine, cloud)))
+                replaced = True
+            else:
+                close_engine(engine)
+        if cloud is not None and not replaced:
             new_engines.append(("cloud", cloud))
         inner._engines = new_engines
         inner._refresh_map()
-        for engine in old_cloud:
-            close_engine(engine)
     elif isinstance(inner, CloudEngine):
         close_engine(inner)
         if cloud is not None:
