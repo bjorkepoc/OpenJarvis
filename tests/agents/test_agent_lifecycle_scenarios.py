@@ -111,9 +111,16 @@ def test_scheduled_agent_rejects_ox_alpha_before_inference(
 
     persisted = h.manager.get_agent(agent["id"])
     assert persisted is not None
-    assert persisted["status"] == "error"
-    assert "unavailable for managed agents" in persisted["summary_memory"]
+    assert persisted["status"] == "idle"
+    assert persisted["summary_memory"] == ""
+    assert persisted["current_activity"] == ""
+    assert persisted["total_runs"] == 0
     assert h.engine.call_count == 0
+    assert not any(
+        event.event_type == EventType.AGENT_TICK_START
+        and event.data.get("agent_id") == agent["id"]
+        for event in h.bus.history
+    )
 
 
 # ---------------------------------------------------------------------------

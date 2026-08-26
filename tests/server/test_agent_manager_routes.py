@@ -204,6 +204,54 @@ class TestAgentManagerRoutes:
         assert manager.list_channel_bindings(agent_id) == []
         assert manager.list_channel_bindings(editable["id"]) == []
 
+    @pytest.mark.parametrize(
+        "model", ["openrouter/stealth/ox-alpha", "stealth/ox-alpha"]
+    )
+    def test_template_entrypoints_reject_effective_ox_before_persisting(
+        self,
+        manager,
+        client,
+        model,
+    ):
+        template = {
+            "id": "user-ox",
+            "source": "user",
+            "name": "User Ox",
+            "agent_type": "deep_research",
+            "model": model,
+            "schedule_type": "interval",
+            "schedule_value": 60,
+        }
+        scheduler = MagicMock()
+        client.app.state.model = "local-model"
+        client.app.state.agent_scheduler = scheduler
+
+        with patch.object(manager, "list_templates", return_value=[template]):
+            create = client.post(
+                "/v1/managed-agents",
+                json={"name": "blocked", "template_id": "user-ox"},
+            )
+            instantiate = client.post(
+                "/v1/templates/user-ox/instantiate",
+                json={"name": "blocked"},
+            )
+
+        assert create.status_code == 400
+        assert instantiate.status_code == 400
+        assert manager.list_agents() == []
+        scheduler.register_agent.assert_not_called()
+
+        template["model"] = "local-model"
+        template["schedule_type"] = "manual"
+        with patch.object(manager, "list_templates", return_value=[template]):
+            allowed = client.post(
+                "/v1/templates/user-ox/instantiate",
+                json={"name": "allowed"},
+            )
+
+        assert allowed.status_code == 200
+        assert allowed.json()["config"]["model"] == "local-model"
+
     def test_delete_agent(self, client):
         create_resp = client.post("/v1/managed-agents", json={"name": "doomed"})
         agent_id = create_resp.json()["id"]

@@ -59,6 +59,20 @@ def _require_managed_agent_model(model: str) -> None:
         raise HTTPException(status_code=400, detail=_OX_ALPHA_MANAGED_AGENT_ERROR)
 
 
+def _create_from_managed_template(
+    manager: AgentManager,
+    template_id: str,
+    name: str,
+    overrides: Optional[Dict[str, Any]],
+    app_state: Any,
+) -> Dict[str, Any]:
+    agent_type, config = manager.resolve_template(template_id, overrides)
+    _require_managed_agent_model(
+        str(config.get("model") or getattr(app_state, "model", "") or "")
+    )
+    return manager.create_agent(name=name, agent_type=agent_type, config=config)
+
+
 def _get_runtime_event_bus(runtime: Any = None) -> Any:
     """Return the server-owned event bus, falling back outside app runtimes."""
 
@@ -1598,18 +1612,22 @@ def create_agent_manager_router(
 
     @agents_router.post("")
     async def create_agent(req: CreateAgentRequest, request: Request):
-        _require_managed_agent_model(
-            str(
-                (req.config or {}).get("model")
-                or getattr(request.app.state, "model", "")
-                or ""
-            )
-        )
         if req.template_id:
-            agent = manager.create_from_template(
-                req.template_id, req.name, overrides=req.config
+            agent = _create_from_managed_template(
+                manager,
+                req.template_id,
+                req.name,
+                req.config,
+                request.app.state,
             )
         else:
+            _require_managed_agent_model(
+                str(
+                    (req.config or {}).get("model")
+                    or getattr(request.app.state, "model", "")
+                    or ""
+                )
+            )
             agent = manager.create_agent(
                 name=req.name, agent_type=req.agent_type, config=req.config
             )
@@ -2258,8 +2276,18 @@ def create_agent_manager_router(
         return {"templates": AgentManager.list_templates()}
 
     @templates_router.post("/{template_id}/instantiate")
-    async def instantiate_template(template_id: str, req: CreateAgentRequest):
-        return manager.create_from_template(template_id, req.name, overrides=req.config)
+    async def instantiate_template(
+        template_id: str,
+        req: CreateAgentRequest,
+        request: Request,
+    ):
+        return _create_from_managed_template(
+            manager,
+            template_id,
+            req.name,
+            req.config,
+            request.app.state,
+        )
 
     # ── Global agent endpoints ───────────────────────────────
 

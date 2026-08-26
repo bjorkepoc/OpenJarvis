@@ -412,6 +412,29 @@ impl BackendManager {
 
 type SharedBackend = Arc<Mutex<BackendManager>>;
 
+async fn spawn_managed_jarvis<F>(
+    backend: &SharedBackend,
+    cmd: &mut tokio::process::Command,
+    load_keys: F,
+) -> std::io::Result<(Option<tokio::process::ChildStderr>, StderrTail)>
+where
+    F: FnOnce() -> Vec<(String, String)>,
+{
+    // Key rotation takes this same lock before updating secure storage. Keep
+    // the key snapshot, spawn, and child registration indivisible so a save
+    // can never observe "offline" after the child captured an older env.
+    let mut manager = backend.lock().await;
+    for (key, value) in load_keys() {
+        cmd.env(&key, &value);
+    }
+    let mut child = cmd.spawn()?;
+    let stderr = child.stderr.take();
+    let tail = manager.jarvis_stderr_tail.clone();
+    manager.jarvis = Some(ChildHandle { child });
+    manager.jarvis_attached = false;
+    Ok((stderr, tail))
+}
+
 // ---------------------------------------------------------------------------
 // Setup status (reported to frontend)
 // ---------------------------------------------------------------------------
@@ -1433,24 +1456,12 @@ async fn boot_backend(backend: SharedBackend, status: SharedStatus) {
     // additions aren't accidentally stripped.
     prepare_subprocess_for_appimage(&mut cmd);
 
-    // Inject cloud API keys from secure desktop storage.
-    for (key, value) in read_cloud_keys() {
-        cmd.env(&key, &value);
-    }
-    let jarvis_child = cmd.spawn();
-
-    match jarvis_child {
-        Ok(mut child) => {
+    match spawn_managed_jarvis(&backend, &mut cmd, read_cloud_keys).await {
+        Ok((stderr_handle, tail)) => {
             // Start draining stderr immediately. If we wait until the
             // health check returns we risk filling the 4 KB Windows pipe
             // buffer during startup logging and hanging the child before
             // it can bind its HTTP port — exactly the symptom in #309.
-            let stderr_handle = child.stderr.take();
-            let mut mgr = backend.lock().await;
-            let tail = mgr.jarvis_stderr_tail.clone();
-            mgr.jarvis = Some(ChildHandle { child });
-            mgr.jarvis_attached = false;
-            drop(mgr);
             if let Some(stderr) = stderr_handle {
                 spawn_jarvis_stderr_drainer(stderr, tail);
             }
@@ -2209,17 +2220,21 @@ async fn save_cloud_key_inner(
     backend: &SharedBackend,
 ) -> Result<(), String> {
     let key_value = key_value.trim().to_string();
-    secure_store_set(&key_name, &key_value)?;
 
     // Tool credentials and custom OpenAI-compatible endpoint keys are read
     // independently. They must not ask CloudEngine to reload or interpret a
     // legitimate `no_cloud` response as a failed save.
     if !cloud_key_requires_reload(&key_name) {
+        secure_store_set(&key_name, &key_value)?;
         return Ok(());
     }
 
     let (owns_child, known_attached) = {
         let manager = backend.lock().await;
+        // Serialized with spawn_managed_jarvis(): either this write wins and
+        // the child snapshots it, or the child is registered before we decide
+        // whether a live reload is required.
+        secure_store_set(&key_name, &key_value)?;
         (manager.jarvis.is_some(), manager.jarvis_attached)
     };
     let server_reachable = if owns_child || known_attached {
@@ -3075,6 +3090,29 @@ mod tests {
         assert!(backend.jarvis_attached);
     }
 
+    #[tokio::test]
+    async fn key_snapshot_and_child_registration_share_backend_lock() {
+        let backend = std::sync::Arc::new(tokio::sync::Mutex::new(
+            BackendManager::default(),
+        ));
+        let lock_probe = backend.clone();
+        let mut cmd = tokio::process::Command::new(HARMLESS_BIN);
+        #[cfg(target_os = "windows")]
+        cmd.args(["/C", "exit", "0"]);
+        cmd.stderr(std::process::Stdio::piped());
+
+        super::spawn_managed_jarvis(&backend, &mut cmd, || {
+            assert!(lock_probe.try_lock().is_err());
+            Vec::new()
+        })
+        .await
+        .unwrap();
+
+        let mut manager = backend.lock().await;
+        assert!(manager.jarvis.is_some());
+        manager.stop_all().await;
+    }
+
     #[test]
     fn tail_returns_whole_string_when_shorter_than_limit() {
         assert_eq!(uv_sync_stderr_tail("short error", 800), "short error");
@@ -3447,7 +3485,7 @@ mod tests {
     #[cfg(target_os = "windows")]
     const HARMLESS_BIN: &str = "cmd";
     #[cfg(not(target_os = "windows"))]
-    const HARMLESS_BIN: &str = "/bin/true";
+    const HARMLESS_BIN: &str = "/usr/bin/true";
 
     #[test]
     fn prepare_subprocess_for_appimage_no_appimage_is_safe() {

@@ -54,7 +54,11 @@ def _restore_sendblue_bindings(app: FastAPI) -> None:
 
                 from openjarvis.engine.cloud import _is_ox_alpha_model
 
+                persisted_model = str(
+                    (agent.get("config", {}) or {}).get("model") or ""
+                )
                 active_models = (
+                    persisted_model,
                     str(getattr(app.state, "model", "") or ""),
                     str(
                         getattr(getattr(app.state, "engine", None), "_model", "") or ""
@@ -100,8 +104,10 @@ def _restore_sendblue_bindings(app: FastAPI) -> None:
                                 DeepResearchAgent,
                             )
 
-                            model_name = getattr(app.state, "model", "") or getattr(
-                                engine, "_model", ""
+                            model_name = (
+                                persisted_model
+                                or getattr(app.state, "model", "")
+                                or getattr(engine, "_model", "")
                             )
                             dr_agent = DeepResearchAgent(
                                 engine=engine,
