@@ -100,8 +100,10 @@ _DEEPSEEK_MODELS = [
 ]
 
 # OpenRouter models — prefixed with "openrouter/" so they can be identified
+_OX_ALPHA_MODEL = "openrouter/stealth/ox-alpha"
+_OX_ALPHA_API_MODEL = "stealth/ox-alpha"
 _OPENROUTER_POPULAR = [
-    "openrouter/stealth/ox-alpha",
+    _OX_ALPHA_MODEL,
     "openrouter/auto",
     "openrouter/openai/gpt-4o",
     "openrouter/anthropic/claude-sonnet-4",
@@ -133,6 +135,41 @@ def _is_deepseek_model(model: str) -> bool:
 
 def _is_openrouter_model(model: str) -> bool:
     return model.startswith("openrouter/")
+
+
+def _ox_alpha_request_options(model: str) -> Dict[str, Any]:
+    if model != _OX_ALPHA_MODEL:
+        return {}
+    return {
+        "extra_body": {
+            "provider": {
+                "allow_fallbacks": False,
+                "data_collection": "deny",
+                "zdr": True,
+                "max_price": {
+                    "prompt": 0,
+                    "completion": 0,
+                    "request": 0,
+                    "image": 0,
+                },
+            }
+        }
+    }
+
+
+def _validate_ox_alpha_response(model: str, response_model: Any, usage: Any) -> float:
+    if model != _OX_ALPHA_MODEL:
+        return 0.0
+    if response_model != _OX_ALPHA_API_MODEL:
+        raise EngineConnectionError(
+            f"OpenRouter returned unexpected Ox Alpha model: {response_model!r}"
+        )
+    cost = getattr(usage, "cost", None)
+    if isinstance(cost, bool) or not isinstance(cost, (int, float)) or cost != 0:
+        raise EngineConnectionError(
+            f"OpenRouter returned non-zero or invalid Ox Alpha cost: {cost!r}"
+        )
+    return float(cost)
 
 
 def _is_codex_model(model: str) -> bool:
@@ -959,6 +996,7 @@ class CloudEngine(InferenceEngine):
             "max_tokens": max_tokens,
             "temperature": temperature,
         }
+        create_kwargs.update(_ox_alpha_request_options(model))
         # Forward tools / tool_choice (OpenRouter is OpenAI-compatible).
         tools = kwargs.pop("tools", None)
         if tools:
@@ -971,6 +1009,7 @@ class CloudEngine(InferenceEngine):
         elapsed = time.monotonic() - t0
         choice = resp.choices[0]
         usage = resp.usage
+        cost_usd = _validate_ox_alpha_response(model, resp.model, usage)
         prompt_tokens = usage.prompt_tokens if usage else 0
         completion_tokens = usage.completion_tokens if usage else 0
         result: Dict[str, Any] = {
@@ -984,6 +1023,8 @@ class CloudEngine(InferenceEngine):
             "finish_reason": choice.finish_reason or "stop",
             "ttft": elapsed,
         }
+        if model == _OX_ALPHA_MODEL:
+            result["cost_usd"] = cost_usd
         if getattr(choice.message, "tool_calls", None):
             result["tool_calls"] = [
                 {
@@ -1490,6 +1531,7 @@ class CloudEngine(InferenceEngine):
             "temperature": temperature,
             "stream": True,
         }
+        create_kwargs.update(_ox_alpha_request_options(model))
         # Forward tools / tool_choice (OpenRouter is OpenAI-compatible).
         tools = kwargs.pop("tools", None)
         if tools:
@@ -1498,10 +1540,15 @@ class CloudEngine(InferenceEngine):
         if tool_choice is not None:
             create_kwargs["tool_choice"] = tool_choice
         resp = self._openrouter_client.chat.completions.create(**create_kwargs)
+        response_model: Any = None
+        final_usage: Any = None
         for chunk in resp:
+            response_model = getattr(chunk, "model", response_model)
+            final_usage = getattr(chunk, "usage", None) or final_usage
             delta = chunk.choices[0].delta if chunk.choices else None
             if delta and delta.content:
                 yield delta.content
+        _validate_ox_alpha_response(model, response_model, final_usage)
 
     async def _stream_minimax(
         self,
@@ -1592,6 +1639,7 @@ class CloudEngine(InferenceEngine):
                 "stream": True,
                 **kwargs,
             }
+            create_kwargs.update(_ox_alpha_request_options(model))
         elif _is_minimax_model(model):
             client = self._minimax_client
             if client is None:
@@ -1632,7 +1680,12 @@ class CloudEngine(InferenceEngine):
             if not _is_openai_reasoning_model(model):
                 create_kwargs["temperature"] = temperature
         resp = client.chat.completions.create(**create_kwargs)
+        response_model: Any = None
+        final_usage: Any = None
         for chunk in resp:
+            if model == _OX_ALPHA_MODEL:
+                response_model = getattr(chunk, "model", response_model)
+                final_usage = getattr(chunk, "usage", None) or final_usage
             choice = chunk.choices[0] if chunk.choices else None
             if not choice:
                 continue
@@ -1660,6 +1713,15 @@ class CloudEngine(InferenceEngine):
                     tool_calls=tool_calls,
                     finish_reason=finish,
                 )
+        if model == _OX_ALPHA_MODEL:
+            _validate_ox_alpha_response(model, response_model, final_usage)
+            yield StreamChunk(
+                usage={
+                    "prompt_tokens": final_usage.prompt_tokens,
+                    "completion_tokens": final_usage.completion_tokens,
+                    "total_tokens": final_usage.total_tokens,
+                }
+            )
 
     async def _stream_full_anthropic(
         self,

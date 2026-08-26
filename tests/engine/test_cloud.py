@@ -19,6 +19,17 @@ from openjarvis.engine.cloud import (
     estimate_cost,
 )
 
+_CLOUD_API_KEY_ENV_VARS = (
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "OPENROUTER_API_KEY",
+    "MINIMAX_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "OPENAI_CODEX_API_KEY",
+)
+
 
 class TestEstimateCost:
     def test_known_model(self) -> None:
@@ -53,15 +64,26 @@ class TestCloudEngineHealth:
 
 class TestCloudEngineListModels:
     def test_list_models_no_keys(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        for name in _CLOUD_API_KEY_ENV_VARS:
+            monkeypatch.delenv(name, raising=False)
         EngineRegistry.register_value("cloud", CloudEngine)
         engine = CloudEngine()
         assert engine.list_models() == []
 
-    def test_list_models_includes_ox_alpha_with_openrouter(self) -> None:
-        engine = CloudEngine()
-        engine._openrouter_client = mock.MagicMock()
+    def test_list_models_includes_ox_alpha_with_openrouter(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        for name in _CLOUD_API_KEY_ENV_VARS:
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+        fake_openai = mock.MagicMock()
+        with mock.patch.dict("sys.modules", {"openai": fake_openai}):
+            engine = CloudEngine()
+
+        fake_openai.OpenAI.assert_called_once_with(
+            base_url="https://openrouter.ai/api/v1",
+            api_key="sk-or-test",
+        )
         assert "openrouter/stealth/ox-alpha" in engine.list_models()
 
 
@@ -441,11 +463,158 @@ class TestOpenRouterToolForwarding:
         sent = fake_client.chat.completions.create.call_args.kwargs
         assert sent["tools"] == tools
         assert sent["tool_choice"] == "auto"
+        assert "extra_body" not in sent
 
         # tool_calls from the response are parsed back into the result
         assert result["tool_calls"][0]["id"] == "call_1"
         assert result["tool_calls"][0]["function"]["name"] == "get_weather"
         assert result["tool_calls"][0]["function"]["arguments"] == '{"city": "NYC"}'
+
+
+class TestOxAlphaFreeRouting:
+    @staticmethod
+    def _engine(response: object) -> tuple[CloudEngine, mock.MagicMock]:
+        client = mock.MagicMock()
+        client.chat.completions.create.return_value = response
+        engine = CloudEngine.__new__(CloudEngine)
+        engine._openrouter_client = client
+        return engine, client
+
+    @staticmethod
+    def _usage(cost: object = 0) -> SimpleNamespace:
+        return SimpleNamespace(
+            prompt_tokens=3,
+            completion_tokens=2,
+            total_tokens=5,
+            cost=cost,
+        )
+
+    @staticmethod
+    def _assert_free_policy(client: mock.MagicMock) -> None:
+        assert client.chat.completions.create.call_args.kwargs["extra_body"] == {
+            "provider": {
+                "allow_fallbacks": False,
+                "data_collection": "deny",
+                "zdr": True,
+                "max_price": {
+                    "prompt": 0,
+                    "completion": 0,
+                    "request": 0,
+                    "image": 0,
+                },
+            }
+        }
+
+    @classmethod
+    def _response(cls, *, model: object = "stealth/ox-alpha", cost: object = 0):
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content="ok", tool_calls=None),
+                    finish_reason="stop",
+                )
+            ],
+            usage=cls._usage(cost),
+            model=model,
+        )
+
+    @classmethod
+    def _stream_chunks(
+        cls, *, model: object = "stealth/ox-alpha", cost: object = 0
+    ) -> list[SimpleNamespace]:
+        return [
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(content="ok", tool_calls=None),
+                        finish_reason=None,
+                    )
+                ],
+                usage=None,
+                model=model,
+            ),
+            SimpleNamespace(choices=[], usage=cls._usage(cost), model=model),
+        ]
+
+    def test_generate_enforces_free_private_route(self) -> None:
+        engine, client = self._engine(self._response())
+
+        result = engine.generate(
+            [Message(role=Role.USER, content="Hi")],
+            model="openrouter/stealth/ox-alpha",
+        )
+
+        self._assert_free_policy(client)
+        assert result["model"] == "stealth/ox-alpha"
+        assert result["cost_usd"] == 0.0
+
+    @pytest.mark.parametrize(
+        ("response_model", "cost"),
+        [
+            ("openai/gpt-4o", 0),
+            ("stealth/ox-alpha", 0.01),
+            ("stealth/ox-alpha", "0"),
+            ("stealth/ox-alpha", None),
+        ],
+    )
+    def test_generate_rejects_untrusted_free_response(
+        self, response_model: object, cost: object
+    ) -> None:
+        engine, _ = self._engine(self._response(model=response_model, cost=cost))
+
+        with pytest.raises(EngineConnectionError):
+            engine.generate(
+                [Message(role=Role.USER, content="Hi")],
+                model="openrouter/stealth/ox-alpha",
+            )
+
+    @pytest.mark.asyncio
+    async def test_stream_enforces_and_audits_free_route(self) -> None:
+        engine, client = self._engine(iter(self._stream_chunks()))
+
+        result = [
+            token
+            async for token in engine.stream(
+                [Message(role=Role.USER, content="Hi")],
+                model="openrouter/stealth/ox-alpha",
+            )
+        ]
+
+        self._assert_free_policy(client)
+        assert result == ["ok"]
+
+    @pytest.mark.asyncio
+    async def test_stream_rejects_nonzero_final_cost(self) -> None:
+        engine, _ = self._engine(iter(self._stream_chunks(cost=0.01)))
+
+        with pytest.raises(EngineConnectionError):
+            _ = [
+                token
+                async for token in engine.stream(
+                    [Message(role=Role.USER, content="Hi")],
+                    model="openrouter/stealth/ox-alpha",
+                )
+            ]
+
+    @pytest.mark.asyncio
+    async def test_stream_full_enforces_and_audits_free_route(self) -> None:
+        engine, client = self._engine(iter(self._stream_chunks()))
+
+        result = [
+            chunk
+            async for chunk in engine.stream_full(
+                [Message(role=Role.USER, content="Hi")],
+                model="openrouter/stealth/ox-alpha",
+            )
+        ]
+
+        self._assert_free_policy(client)
+        assert result[0].content == "ok"
+        assert result[-1].usage == {
+            "prompt_tokens": 3,
+            "completion_tokens": 2,
+            "total_tokens": 5,
+        }
 
 
 class TestCloudEngineCanServe:
