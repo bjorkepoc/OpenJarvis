@@ -411,26 +411,29 @@ class TestChatCompletions:
     def test_instrumented_engine_unwrapped_to_avoid_dual_telemetry(self):
         """Regression for the leaderboard wonky-values bug.
 
-        When `app.state.engine` is already an `InstrumentedEngine` (which is
-        the common case when the server was constructed with telemetry
-        wired in), `_handle_direct` MUST NOT wrap it again with
+        When the model-selected route already contains an `InstrumentedEngine`,
+        `_handle_direct` MUST NOT wrap it again with
         `instrumented_generate`. Both layers publish `TELEMETRY_RECORD`
         events, so wrapping twice would double-count every call into the
         leaderboard pipeline and inflate per-token energy / FLOPs metrics
         by 2× on every request — the dominant contributor to the bimodal
         Wh/token distribution on the public leaderboard.
 
-        The fix unwraps the engine via `engine._inner` before passing it
-        to `instrumented_generate`. This test pins that contract.
+        This test pins that contract through the production wrapper stack.
         """
         from openjarvis.core.events import EventBus, EventType
+        from openjarvis.engine.multi import MultiEngine
+        from openjarvis.security.guardrails import GuardrailsEngine
         from openjarvis.telemetry.instrumented_engine import InstrumentedEngine
 
         # Build a fresh engine + bus and explicitly wrap with
         # InstrumentedEngine (mirrors the production app construction).
         inner_engine = _make_engine(content="Telemetry test")
         bus = EventBus()
-        wrapped = InstrumentedEngine(inner_engine, bus=bus)
+        wrapped = GuardrailsEngine(
+            MultiEngine([("primary", InstrumentedEngine(inner_engine, bus=bus))]),
+            scanners=[],
+        )
 
         received_records = []
         bus.subscribe(

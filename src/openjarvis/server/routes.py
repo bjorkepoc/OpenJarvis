@@ -449,6 +449,29 @@ def _engine_key_for_model(engine: Any, model: str) -> str | None:
     return None
 
 
+def _model_engine_is_instrumented(engine: Any, model: str) -> bool:
+    """Whether the engine selected for *model* publishes telemetry itself."""
+    from openjarvis.engine.multi import MultiEngine
+    from openjarvis.security.guardrails import GuardrailsEngine
+    from openjarvis.telemetry.instrumented_engine import InstrumentedEngine
+
+    current = engine
+    while current is not None:
+        if isinstance(current, InstrumentedEngine):
+            return True
+        if isinstance(current, GuardrailsEngine):
+            current = current._engine
+            continue
+        if isinstance(current, MultiEngine):
+            try:
+                current = current._engine_for(model)
+            except ValueError:
+                return False
+            continue
+        return False
+    return False
+
+
 def _uses_direct_cloud_router(engine: Any, model: str) -> bool:
     """Whether *model* should bypass the configured engine for direct cloud."""
     from openjarvis.engine.cloud import _is_ox_alpha_model
@@ -476,12 +499,10 @@ def _handle_direct(
     if req.tools:
         kwargs["tools"] = req.tools
     if bus:
-        from openjarvis.telemetry.instrumented_engine import InstrumentedEngine
         from openjarvis.telemetry.wrapper import instrumented_generate
 
-        # `app.state.engine` may already be an InstrumentedEngine (the
-        # common case when telemetry is wired in). If we then wrap it
-        # with `instrumented_generate`, BOTH layers fire a
+        # The model-selected route may already contain an InstrumentedEngine.
+        # If we then wrap it with `instrumented_generate`, BOTH layers fire a
         # TELEMETRY_RECORD per call:
         #
         #   - InstrumentedEngine.generate() publishes a FULL record
@@ -498,11 +519,11 @@ def _handle_direct(
         # which the leaderboard's `current_methodology_only=True` filter
         # would then drop entirely. Instead, when the engine is already
         # an InstrumentedEngine, skip the wrapper and call `generate`
-        # directly — InstrumentedEngine publishes the full per-record
+        # directly — the selected InstrumentedEngine publishes the full per-record
         # event itself with energy + version intact. Only fall back to
         # the lightweight wrapper for engines that aren't already
         # instrumented.
-        if isinstance(engine, InstrumentedEngine):
+        if _model_engine_is_instrumented(engine, model):
             result = engine.generate(
                 messages,
                 model=model,
@@ -1332,6 +1353,8 @@ async def savings(request: Request):
         summary = agg.summary(since=session_start, current_methodology_only=True)
         # Exclude cloud model tokens from savings — only local
         # inference counts toward cost savings.
+        from openjarvis.engine.cloud import _is_ox_alpha_model
+
         _cloud_prefixes = (
             "gpt-",
             "o1-",
@@ -1344,7 +1367,8 @@ async def savings(request: Request):
         local_models = [
             m
             for m in summary.per_model
-            if not any(m.model_id.startswith(p) for p in _cloud_prefixes)
+            if not _is_ox_alpha_model(m.model_id)
+            and not any(m.model_id.startswith(p) for p in _cloud_prefixes)
         ]
         result = compute_savings(
             prompt_tokens=sum(m.prompt_tokens for m in local_models),

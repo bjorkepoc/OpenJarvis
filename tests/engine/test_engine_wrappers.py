@@ -116,6 +116,7 @@ def test_multi_routes_bare_ox_alias_to_guarded_cloud_engine():
     multi = MultiEngine([("litellm", litellm), ("cloud", cloud)])
 
     assert multi._engine_for("stealth/ox-alpha") is cloud
+    assert multi.engine_key_for("stealth/ox-alpha") == "cloud"
 
 
 @pytest.mark.asyncio
