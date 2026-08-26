@@ -146,6 +146,64 @@ class TestAgentManagerRoutes:
         assert resp.status_code == 200
         assert resp.json()["name"] == "new"
 
+    @pytest.mark.parametrize(
+        "model", ["openrouter/stealth/ox-alpha", "stealth/ox-alpha"]
+    )
+    def test_managed_agent_api_rejects_ox_alpha(self, manager, client, model):
+        client.app.state.model = model
+
+        create = client.post(
+            "/v1/managed-agents",
+            json={"name": "blocked"},
+        )
+        assert create.status_code == 400
+        assert manager.list_agents() == []
+
+        editable = manager.create_agent(name="editable", agent_type="simple")
+        update = client.patch(
+            f"/v1/managed-agents/{editable['id']}",
+            json={"config": {"model": model}},
+        )
+        assert update.status_code == 400
+        default_channel = client.post(
+            f"/v1/managed-agents/{editable['id']}/channels",
+            json={"channel_type": "sendblue"},
+        )
+        assert default_channel.status_code == 400
+        client.app.state.model = "local-model"
+        client.app.state.engine = SimpleNamespace(_model=model)
+        engine_channel = client.post(
+            f"/v1/managed-agents/{editable['id']}/channels",
+            json={"channel_type": "sendblue"},
+        )
+        assert engine_channel.status_code == 400
+
+        agent = manager.create_agent(
+            name="existing",
+            agent_type="simple",
+            config={"model": model},
+        )
+        agent_id = agent["id"]
+        client.app.state.model = model
+
+        run = client.post(f"/v1/managed-agents/{agent_id}/run")
+        message = client.post(
+            f"/v1/managed-agents/{agent_id}/messages",
+            json={"content": "hello", "mode": "queued"},
+        )
+        channel = client.post(
+            f"/v1/managed-agents/{agent_id}/channels",
+            json={"channel_type": "sendblue"},
+        )
+
+        assert run.status_code == 400
+        assert message.status_code == 400
+        assert channel.status_code == 400
+        assert manager.get_agent(agent_id)["status"] == "idle"
+        assert manager.list_messages(agent_id) == []
+        assert manager.list_channel_bindings(agent_id) == []
+        assert manager.list_channel_bindings(editable["id"]) == []
+
     def test_delete_agent(self, client):
         create_resp = client.post("/v1/managed-agents", json={"name": "doomed"})
         agent_id = create_resp.json()["id"]

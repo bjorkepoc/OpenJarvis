@@ -32,6 +32,31 @@ except ImportError:
 logger = logging.getLogger("openjarvis.server.agent_manager")
 _MEMORY_BACKEND_LOCK_SETUP = threading.Lock()
 _MCP_LOCK_SETUP = threading.Lock()
+_OX_ALPHA_MANAGED_AGENT_ERROR = (
+    "Ox Alpha is unavailable for managed agents, schedules, and messaging "
+    "channels because their multi-call provider paths cannot be audited "
+    "fail-closed"
+)
+
+
+def _managed_agent_model(agent_record: Dict[str, Any], app_state: Any) -> str:
+    """Resolve the model an API-managed agent would use."""
+
+    config = agent_record.get("config", {}) or {}
+    engine = getattr(app_state, "engine", None)
+    return str(
+        config.get("model")
+        or getattr(app_state, "model", "")
+        or getattr(engine, "_model", "")
+        or ""
+    )
+
+
+def _require_managed_agent_model(model: str) -> None:
+    from openjarvis.engine.cloud import _is_ox_alpha_model
+
+    if _is_ox_alpha_model(model):
+        raise HTTPException(status_code=400, detail=_OX_ALPHA_MANAGED_AGENT_ERROR)
 
 
 def _get_runtime_event_bus(runtime: Any = None) -> Any:
@@ -878,6 +903,7 @@ async def _stream_managed_agent(
         or getattr(app_state, "model", None)
         or getattr(engine, "_model", "")
     )
+    _require_managed_agent_model(str(model or ""))
     system_prompt = config.get("system_prompt")
     temperature = config.get("temperature", 0.7)
     max_tokens = config.get("max_tokens", 1024)
@@ -1572,6 +1598,13 @@ def create_agent_manager_router(
 
     @agents_router.post("")
     async def create_agent(req: CreateAgentRequest, request: Request):
+        _require_managed_agent_model(
+            str(
+                (req.config or {}).get("model")
+                or getattr(request.app.state, "model", "")
+                or ""
+            )
+        )
         if req.template_id:
             agent = manager.create_from_template(
                 req.template_id, req.name, overrides=req.config
@@ -1597,8 +1630,9 @@ def create_agent_manager_router(
         return agent
 
     @agents_router.patch("/{agent_id}")
-    async def update_agent(agent_id: str, req: UpdateAgentRequest):
-        if not manager.get_agent(agent_id):
+    async def update_agent(agent_id: str, req: UpdateAgentRequest, request: Request):
+        existing = manager.get_agent(agent_id)
+        if not existing:
             raise HTTPException(status_code=404, detail="Agent not found")
         kwargs: Dict[str, Any] = {}
         if req.name is not None:
@@ -1606,6 +1640,13 @@ def create_agent_manager_router(
         if req.agent_type is not None:
             kwargs["agent_type"] = req.agent_type
         if req.config is not None:
+            _require_managed_agent_model(
+                str(
+                    req.config.get("model")
+                    or getattr(request.app.state, "model", "")
+                    or ""
+                )
+            )
             kwargs["config"] = req.config
         return manager.update_agent(agent_id, **kwargs)
 
@@ -1637,6 +1678,7 @@ def create_agent_manager_router(
             raise HTTPException(status_code=404, detail="Agent not found")
         if agent["status"] == "archived":
             raise HTTPException(status_code=400, detail="Agent is archived")
+        _require_managed_agent_model(_managed_agent_model(agent, request.app.state))
 
         # Auto-recover from error/needs_attention state
         if agent["status"] in ("error", "needs_attention"):
@@ -1767,8 +1809,23 @@ def create_agent_manager_router(
         req: BindChannelRequest,
         request: Request,
     ):
-        if not manager.get_agent(agent_id):
+        agent_record = manager.get_agent(agent_id)
+        if not agent_record:
             raise HTTPException(status_code=404, detail="Agent not found")
+        _require_managed_agent_model(
+            _managed_agent_model(agent_record, request.app.state)
+        )
+        _require_managed_agent_model(str(getattr(request.app.state, "model", "") or ""))
+        _require_managed_agent_model(
+            str(
+                getattr(
+                    getattr(request.app.state, "engine", None),
+                    "_model",
+                    "",
+                )
+                or ""
+            )
+        )
         binding = manager.bind_channel(
             agent_id,
             channel_type=req.channel_type,
@@ -1983,6 +2040,9 @@ def create_agent_manager_router(
         agent_record = manager.get_agent(agent_id)
         if not agent_record:
             raise HTTPException(status_code=404, detail="Agent not found")
+        _require_managed_agent_model(
+            _managed_agent_model(agent_record, request.app.state)
+        )
 
         # Auto-recover error-state agents on immediate messages
         if req.mode == "immediate" and agent_record["status"] in (

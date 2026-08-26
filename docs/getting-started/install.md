@@ -76,7 +76,8 @@ collection, and support zero data retention. OpenJarvis never falls back to a le
 private or paid endpoint, so Ox Alpha may be unavailable when no compliant endpoint
 is online. Ox Alpha requests also bypass server-side agent orchestration whose
 internal provider calls cannot be audited against these constraints; Deep
-Research is unavailable while Ox Alpha is selected.
+Research, managed agents, schedules, and messaging channels are unavailable
+while Ox Alpha is selected.
 
 ## Flags
 

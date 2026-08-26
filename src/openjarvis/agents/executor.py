@@ -326,6 +326,14 @@ class AgentExecutor:
             except Exception:
                 pass  # Fall back to configured model
 
+        from openjarvis.engine.cloud import _is_ox_alpha_model
+
+        if _is_ox_alpha_model(model):
+            raise FatalError(
+                "Ox Alpha is unavailable for managed agents because their "
+                "multi-call provider path cannot be audited fail-closed"
+            )
+
         mcp_tools: list[Any] = []
         mcp_clients: list[Any] = []
         if (

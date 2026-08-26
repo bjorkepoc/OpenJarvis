@@ -378,6 +378,7 @@ const STDERR_TAIL_LIMIT: usize = 16 * 1024;
 struct BackendManager {
     ollama: Option<ChildHandle>,
     jarvis: Option<ChildHandle>,
+    jarvis_attached: bool,
     jarvis_stderr_tail: StderrTail,
 }
 
@@ -386,6 +387,7 @@ impl Default for BackendManager {
         Self {
             ollama: None,
             jarvis: None,
+            jarvis_attached: false,
             jarvis_stderr_tail: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -393,10 +395,14 @@ impl Default for BackendManager {
 
 impl BackendManager {
     async fn stop_all(&mut self) {
+        let owned_jarvis = self.jarvis.is_some();
         if let Some(ref mut h) = self.jarvis {
             h.kill().await;
         }
         self.jarvis = None;
+        if owned_jarvis {
+            self.jarvis_attached = false;
+        }
         if let Some(ref mut h) = self.ollama {
             h.kill().await;
         }
@@ -1270,6 +1276,7 @@ async fn boot_backend(backend: SharedBackend, status: SharedStatus) {
                     // pre-spawn step done so the setup UI doesn't show a
                     // half-progress bar (model_ready / ollama_ready stay
                     // false otherwise because we skipped those steps).
+                    backend.lock().await.jarvis_attached = true;
                     let mut s = status.lock().await;
                     s.phase = "ready".into();
                     s.detail = format!(
@@ -1442,6 +1449,7 @@ async fn boot_backend(backend: SharedBackend, status: SharedStatus) {
             let mut mgr = backend.lock().await;
             let tail = mgr.jarvis_stderr_tail.clone();
             mgr.jarvis = Some(ChildHandle { child });
+            mgr.jarvis_attached = false;
             drop(mgr);
             if let Some(stderr) = stderr_handle {
                 spawn_jarvis_stderr_drainer(stderr, tail);
@@ -1953,6 +1961,21 @@ const MANAGED_CLOUD_KEY_NAMES: &[&str] = &[
     "TAVILY_API_KEY",
 ];
 
+const CLOUD_ENGINE_KEY_NAMES: &[&str] = &[
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "OPENROUTER_API_KEY",
+    "MINIMAX_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "OPENAI_CODEX_API_KEY",
+];
+
+fn cloud_key_requires_reload(key_name: &str) -> bool {
+    CLOUD_ENGINE_KEY_NAMES.contains(&key_name)
+}
+
 /// Legacy path used by older desktop builds. New saves never write here.
 fn legacy_cloud_keys_path() -> std::path::PathBuf {
     let home = home_dir();
@@ -2141,6 +2164,35 @@ async fn reload_cloud_keys(keys: Vec<(String, String)>) -> Result<(), String> {
     validate_cloud_reload_response(&body, removing)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum JarvisReloadTarget {
+    Offline,
+    Managed,
+    Attached,
+}
+
+fn jarvis_reload_target(
+    owns_child: bool,
+    known_attached: bool,
+    server_reachable: bool,
+) -> JarvisReloadTarget {
+    if owns_child {
+        JarvisReloadTarget::Managed
+    } else if known_attached || server_reachable {
+        JarvisReloadTarget::Attached
+    } else {
+        JarvisReloadTarget::Offline
+    }
+}
+
+fn jarvis_server_present() -> bool {
+    // Port occupancy is a safer liveness signal than an HTTP timeout here:
+    // an overloaded attached server can still own the port even when /health
+    // does not answer quickly. Treat any listener as live and require reload
+    // confirmation rather than returning a false offline success.
+    check_jarvis_port_available().is_err()
+}
+
 /// Save a single cloud API key to secure desktop storage.
 #[tauri::command]
 async fn save_cloud_key(
@@ -2159,18 +2211,43 @@ async fn save_cloud_key_inner(
     let key_value = key_value.trim().to_string();
     secure_store_set(&key_name, &key_value)?;
 
+    // Tool credentials and custom OpenAI-compatible endpoint keys are read
+    // independently. They must not ask CloudEngine to reload or interpret a
+    // legitimate `no_cloud` response as a failed save.
+    if !cloud_key_requires_reload(&key_name) {
+        return Ok(());
+    }
+
+    let (owns_child, known_attached) = {
+        let manager = backend.lock().await;
+        (manager.jarvis.is_some(), manager.jarvis_attached)
+    };
+    let server_reachable = if owns_child || known_attached {
+        false
+    } else {
+        jarvis_server_present()
+    };
+    let reload_target =
+        jarvis_reload_target(owns_child, known_attached, server_reachable);
+
     // During first-run setup the server has not started yet, so there is no
     // in-memory credential to revoke or rotate. Boot reads the secure store.
-    if backend.lock().await.jarvis.is_none() {
+    if reload_target == JarvisReloadTarget::Offline {
         return Ok(());
     }
 
     // Tell the running server to hot-reload its cloud engine so the user
     // doesn't need to restart the app after entering an API key.
     if let Err(error) = reload_cloud_keys(vec![(key_name, key_value)]).await {
-        backend.lock().await.stop_all().await;
+        if reload_target == JarvisReloadTarget::Managed {
+            backend.lock().await.stop_all().await;
+            return Err(format!(
+                "{}; backend stopped to prevent use of stale credentials",
+                error
+            ));
+        }
         return Err(format!(
-            "{}; backend stopped to prevent use of stale credentials",
+            "{}; attached backend did not confirm the credential reload — restart it before continuing",
             error
         ));
     }
@@ -2208,7 +2285,6 @@ async fn set_inference_source(
     host: Option<String>,
     engine: Option<String>,
     api_key: Option<String>,
-    backend: tauri::State<'_, SharedBackend>,
 ) -> Result<(), String> {
     let kind = match kind.as_str() {
         "ollama" => SourceKind::Ollama,
@@ -2237,8 +2313,7 @@ async fn set_inference_source(
             // Save the key before persisting the config: if the key can't be
             // written, surface it and DON'T record a custom source whose
             // credential is missing (which would fail confusingly at runtime).
-            save_cloud_key_inner(key_name, key, backend.inner())
-                .await
+            secure_store_set(&key_name, key.trim())
                 .map_err(|e| format!("Could not store the API key: {}", e))?;
         }
     }
@@ -2925,8 +3000,8 @@ mod tests {
         format_uv_sync_spawn_error, matching_installed_model, model_names_match, normalize_host,
         parse_inference_config, parse_ollama_model_names, preferred_installed_model,
         should_persist_resolved_model, startup_installed_model, upsert_engine_host,
-        uv_sync_stderr_tail, validate_cloud_reload_response, InferenceConfig, SourceKind,
-        DESKTOP_UV_SYNC_COMMAND,
+        uv_sync_stderr_tail, validate_cloud_reload_response, BackendManager,
+        InferenceConfig, JarvisReloadTarget, SourceKind, DESKTOP_UV_SYNC_COMMAND,
     };
     use std::path::Path;
 
@@ -2947,6 +3022,57 @@ mod tests {
             false,
         )
         .is_err());
+    }
+
+    #[test]
+    fn only_cloud_engine_keys_trigger_reload() {
+        for key in [
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+            "OPENROUTER_API_KEY",
+            "MINIMAX_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "OPENAI_CODEX_API_KEY",
+        ] {
+            assert!(super::cloud_key_requires_reload(key), "{key}");
+        }
+        for key in ["TAVILY_API_KEY", "LMSTUDIO_API_KEY", "CUSTOM_API_KEY"] {
+            assert!(!super::cloud_key_requires_reload(key), "{key}");
+        }
+    }
+
+    #[test]
+    fn attached_server_is_never_mistaken_for_offline() {
+        assert_eq!(
+            super::jarvis_reload_target(false, true, false),
+            JarvisReloadTarget::Attached
+        );
+        assert_eq!(
+            super::jarvis_reload_target(false, false, true),
+            JarvisReloadTarget::Attached
+        );
+        assert_eq!(
+            super::jarvis_reload_target(true, false, false),
+            JarvisReloadTarget::Managed
+        );
+        assert_eq!(
+            super::jarvis_reload_target(false, false, false),
+            JarvisReloadTarget::Offline
+        );
+    }
+
+    #[tokio::test]
+    async fn stopping_does_not_claim_an_attached_server_was_stopped() {
+        let mut backend = BackendManager {
+            jarvis_attached: true,
+            ..Default::default()
+        };
+
+        backend.stop_all().await;
+
+        assert!(backend.jarvis_attached);
     }
 
     #[test]
