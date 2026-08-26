@@ -65,6 +65,20 @@ def _test_config():
     return cfg
 
 
+def _clear_cloud_keys(monkeypatch):
+    for name in (
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "OPENROUTER_API_KEY",
+        "MINIMAX_API_KEY",
+        "DEEPSEEK_API_KEY",
+        "OPENAI_CODEX_API_KEY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
 @pytest.fixture
 def client():
     engine = _make_engine()
@@ -1539,12 +1553,16 @@ class TestModelsEndpoint:
     @pytest.mark.parametrize(
         "model", ["openrouter/stealth/ox-alpha", "stealth/ox-alpha"]
     )
-    def test_ox_streams_through_guarded_engine(self, model):
+    @pytest.mark.parametrize("stream", [False, True])
+    def test_ox_uses_guarded_engine_instead_of_server_agent(self, model, stream):
         engine = _make_engine(models=[model])
         engine.engine_id = "cloud"
+        agent = _make_agent(content="unsafe agent route")
+        agent._tools = [object()]
         app = create_app(
             engine,
             model,
+            agent=agent,
             engine_name="cloud",
             config=_test_config(),
         )
@@ -1562,19 +1580,20 @@ class TestModelsEndpoint:
                 json={
                     "model": model,
                     "messages": [{"role": "user", "content": "hello"}],
-                    "stream": True,
+                    "stream": stream,
                 },
             )
 
         assert resp.status_code == 200
         stream_cloud.assert_not_called()
         assert "Hello" in resp.text
+        agent.run.assert_not_called()
 
     def test_cloud_reload_preserves_guardrail_wrapper(self, monkeypatch):
         from openjarvis.engine.multi import MultiEngine
         from openjarvis.security.guardrails import GuardrailsEngine
 
-        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        _clear_cloud_keys(monkeypatch)
         monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
         guarded = GuardrailsEngine(_make_engine(), scanners=[])
         app = create_app(
@@ -1592,6 +1611,63 @@ class TestModelsEndpoint:
         assert resp.status_code == 200
         assert isinstance(app.state.engine, GuardrailsEngine)
         assert isinstance(app.state.engine._engine, MultiEngine)
+
+    def test_cloud_reload_replaces_cloud_only_engine(self, monkeypatch):
+        from openjarvis.engine.cloud import CloudEngine
+        from openjarvis.security.guardrails import GuardrailsEngine
+        from openjarvis.telemetry.instrumented_engine import InstrumentedEngine
+
+        _clear_cloud_keys(monkeypatch)
+        monkeypatch.setenv("OPENROUTER_API_KEY", "old-key")
+        old_cloud = CloudEngine()
+        instrumented = InstrumentedEngine(old_cloud, EventBus())
+        guarded = GuardrailsEngine(instrumented, scanners=[])
+        app = create_app(
+            guarded,
+            "openrouter/stealth/ox-alpha",
+            engine_name="cloud",
+            config=_test_config(),
+        )
+
+        resp = TestClient(app).post(
+            "/v1/cloud/reload",
+            json={"keys": {"OPENROUTER_API_KEY": "new-key"}},
+        )
+
+        assert resp.json()["status"] == "ok"
+        assert guarded._engine is instrumented
+        assert isinstance(instrumented._inner, CloudEngine)
+        assert instrumented._inner is not old_cloud
+        assert old_cloud._openrouter_client is None
+
+    def test_cloud_reload_removes_revoked_cloud_route(self, monkeypatch):
+        from openjarvis.engine.cloud import CloudEngine
+        from openjarvis.engine.multi import MultiEngine
+        from openjarvis.security.guardrails import GuardrailsEngine
+
+        _clear_cloud_keys(monkeypatch)
+        monkeypatch.setenv("OPENROUTER_API_KEY", "old-key")
+        old_cloud = CloudEngine()
+        multi = MultiEngine([("mock", _make_engine()), ("cloud", old_cloud)])
+        guarded = GuardrailsEngine(multi, scanners=[])
+        app = create_app(
+            guarded,
+            "openrouter/stealth/ox-alpha",
+            engine_name="multi",
+            config=_test_config(),
+        )
+
+        resp = TestClient(app).post(
+            "/v1/cloud/reload",
+            json={"keys": {"OPENROUTER_API_KEY": ""}},
+        )
+
+        assert resp.json()["status"] == "no_cloud"
+        assert all(key != "cloud" for key, _engine in multi._engines)
+        assert old_cloud._openrouter_client is None
+        for model in ("openrouter/stealth/ox-alpha", "stealth/ox-alpha"):
+            with pytest.raises(ValueError):
+                multi._engine_for(model)
 
 
 # ---------------------------------------------------------------------------

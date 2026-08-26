@@ -97,8 +97,13 @@ def _resolve_server_model(
     available = _unique_model_ids(
         _safe_list_models(engine) + list(all_models.get(engine_name, []))
     )
+    from openjarvis.engine.cloud import _is_ox_alpha_model
 
     for candidate in candidates:
+        # Ox Alpha must fail closed rather than silently switching to a paid
+        # configured fallback. The cloud engine accepts both public aliases.
+        if _is_ox_alpha_model(candidate):
+            return candidate
         if candidate and (not available or candidate in available):
             return candidate
 

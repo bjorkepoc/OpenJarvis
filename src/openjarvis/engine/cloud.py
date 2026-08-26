@@ -5,6 +5,7 @@ OpenAI, Anthropic, Google, MiniMax, and DeepSeek API backends.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -1552,23 +1553,33 @@ class CloudEngine(InferenceEngine):
         tool_choice = kwargs.pop("tool_choice", None)
         if tool_choice is not None:
             create_kwargs["tool_choice"] = tool_choice
+
+        if _is_ox_alpha_model(model):
+
+            def collect() -> List[str]:
+                resp = self._openrouter_client.chat.completions.create(**create_kwargs)
+                response_model: Any = None
+                final_usage: Any = None
+                pending: List[str] = []
+                for chunk in resp:
+                    response_model = getattr(chunk, "model", response_model)
+                    final_usage = getattr(chunk, "usage", None) or final_usage
+                    _validate_ox_alpha_model(model, response_model)
+                    delta = chunk.choices[0].delta if chunk.choices else None
+                    if delta and delta.content:
+                        pending.append(delta.content)
+                _validate_ox_alpha_response(model, response_model, final_usage)
+                return pending
+
+            for token in await asyncio.to_thread(collect):
+                yield token
+            return
+
         resp = self._openrouter_client.chat.completions.create(**create_kwargs)
-        response_model: Any = None
-        final_usage: Any = None
-        pending: List[str] = []
         for chunk in resp:
-            response_model = getattr(chunk, "model", response_model)
-            final_usage = getattr(chunk, "usage", None) or final_usage
-            _validate_ox_alpha_model(model, response_model)
             delta = chunk.choices[0].delta if chunk.choices else None
             if delta and delta.content:
-                if _is_ox_alpha_model(model):
-                    pending.append(delta.content)
-                else:
-                    yield delta.content
-        _validate_ox_alpha_response(model, response_model, final_usage)
-        for token in pending:
-            yield token
+                yield delta.content
 
     async def _stream_minimax(
         self,
@@ -1699,18 +1710,10 @@ class CloudEngine(InferenceEngine):
             }
             if not _is_openai_reasoning_model(model):
                 create_kwargs["temperature"] = temperature
-        resp = client.chat.completions.create(**create_kwargs)
-        response_model: Any = None
-        final_usage: Any = None
-        pending: List[StreamChunk] = []
-        for chunk in resp:
-            if _is_ox_alpha_model(model):
-                response_model = getattr(chunk, "model", response_model)
-                final_usage = getattr(chunk, "usage", None) or final_usage
-                _validate_ox_alpha_model(model, response_model)
-            choice = chunk.choices[0] if chunk.choices else None
+
+        def convert_choice(choice: Any) -> StreamChunk | None:
             if not choice:
-                continue
+                return None
             delta = choice.delta
             content = delta.content if delta else None
             tool_calls = None
@@ -1730,26 +1733,55 @@ class CloudEngine(InferenceEngine):
                 ]
             finish = choice.finish_reason
             if content or tool_calls or finish:
-                stream_chunk = StreamChunk(
+                return StreamChunk(
                     content=content,
                     tool_calls=tool_calls,
                     finish_reason=finish,
                 )
-                if _is_ox_alpha_model(model):
-                    pending.append(stream_chunk)
-                else:
-                    yield stream_chunk
+            return None
+
         if _is_ox_alpha_model(model):
-            _validate_ox_alpha_response(model, response_model, final_usage)
+
+            def collect() -> tuple[List[StreamChunk], Dict[str, Any]]:
+                resp = client.chat.completions.create(**create_kwargs)
+                response_model: Any = None
+                final_usage: Any = None
+                pending: List[StreamChunk] = []
+                for chunk in resp:
+                    response_model = getattr(chunk, "model", response_model)
+                    final_usage = getattr(chunk, "usage", None) or final_usage
+                    _validate_ox_alpha_model(model, response_model)
+                    choice = chunk.choices[0] if chunk.choices else None
+                    stream_chunk = convert_choice(choice)
+                    if stream_chunk is not None:
+                        pending.append(stream_chunk)
+                _validate_ox_alpha_response(model, response_model, final_usage)
+                usage = {
+                    name: (
+                        final_usage.get(name, 0)
+                        if isinstance(final_usage, dict)
+                        else getattr(final_usage, name, 0)
+                    )
+                    for name in (
+                        "prompt_tokens",
+                        "completion_tokens",
+                        "total_tokens",
+                    )
+                }
+                return pending, usage
+
+            pending, usage = await asyncio.to_thread(collect)
             for stream_chunk in pending:
                 yield stream_chunk
-            yield StreamChunk(
-                usage={
-                    "prompt_tokens": final_usage.prompt_tokens,
-                    "completion_tokens": final_usage.completion_tokens,
-                    "total_tokens": final_usage.total_tokens,
-                }
-            )
+            yield StreamChunk(usage=usage)
+            return
+
+        resp = client.chat.completions.create(**create_kwargs)
+        for chunk in resp:
+            choice = chunk.choices[0] if chunk.choices else None
+            stream_chunk = convert_choice(choice)
+            if stream_chunk is not None:
+                yield stream_chunk
 
     async def _stream_full_anthropic(
         self,

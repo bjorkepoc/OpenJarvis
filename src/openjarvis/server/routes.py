@@ -161,8 +161,11 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
     engine = request.app.state.engine
     agent = getattr(request.app.state, "agent", None)
     model = request_body.model
+    from openjarvis.engine.cloud import _is_ox_alpha_model
+
     use_server_agent = (
         agent is not None
+        and not _is_ox_alpha_model(model)
         and not request_body.tools
         and (not request_body.stream or bool(getattr(agent, "_tools", None)))
     )
@@ -1286,43 +1289,80 @@ async def reload_cloud_engine(request: Request):
                     k, v = line.split("=", 1)
                     os.environ[k.strip()] = v.strip()
 
-    # Try to build a fresh CloudEngine.
+    from openjarvis.engine.cloud import CloudEngine
+    from openjarvis.engine.multi import MultiEngine
+    from openjarvis.security.guardrails import GuardrailsEngine
+    from openjarvis.telemetry.instrumented_engine import InstrumentedEngine
+
+    # Build the replacement before closing the current route, then always
+    # detach the old client so key removal and rotation take effect immediately.
+    cloud = None
+    build_error = None
     try:
-        from openjarvis.engine.cloud import CloudEngine
-        from openjarvis.engine.multi import MultiEngine
-        from openjarvis.security.guardrails import GuardrailsEngine
-
-        cloud = CloudEngine()
-        if not cloud.health():
-            return {
-                "status": "no_cloud",
-                "message": "No cloud models available (check API keys)",
-            }
+        candidate = CloudEngine()
+        if candidate.health():
+            cloud = candidate
+        else:
+            candidate.close()
     except Exception as exc:
-        return {"status": "error", "message": str(exc)}
+        build_error = exc
 
-    # Locate the routed engine without discarding its security/telemetry wrapper.
+    # Locate the routed engine without discarding security/telemetry wrappers.
     outer = request.app.state.engine
-    wrapper_attr = "_engine" if isinstance(outer, GuardrailsEngine) else "_inner"
-    inner = getattr(outer, wrapper_attr, outer)
+    parent = None
+    parent_attr = None
+    inner = outer
+    while isinstance(inner, (GuardrailsEngine, InstrumentedEngine)):
+        parent = inner
+        parent_attr = "_engine" if isinstance(inner, GuardrailsEngine) else "_inner"
+        inner = getattr(inner, parent_attr)
+
+    def close_engine(engine) -> None:
+        try:
+            while isinstance(engine, (GuardrailsEngine, InstrumentedEngine)):
+                attr = "_engine" if isinstance(engine, GuardrailsEngine) else "_inner"
+                engine = getattr(engine, attr)
+            engine.close()
+        except Exception:
+            logging.getLogger("openjarvis.server").debug(
+                "Failed to close replaced cloud engine", exc_info=True
+            )
 
     if isinstance(inner, MultiEngine):
-        # Replace or insert the cloud entry in the existing MultiEngine.
-        new_engines = [(k, e) for k, e in inner._engines if k != "cloud"]
-        new_engines.append(("cloud", cloud))
+        old_cloud = [engine for key, engine in inner._engines if key == "cloud"]
+        new_engines = [
+            (key, engine) for key, engine in inner._engines if key != "cloud"
+        ]
+        if cloud is not None:
+            new_engines.append(("cloud", cloud))
         inner._engines = new_engines
         inner._refresh_map()
-    else:
-        # Wrap the existing engine (which may be security-wrapped) with a new
-        # MultiEngine that includes the cloud engine.
+        for engine in old_cloud:
+            close_engine(engine)
+    elif isinstance(inner, CloudEngine):
+        close_engine(inner)
+        if cloud is not None:
+            if parent is None:
+                request.app.state.engine = cloud
+            else:
+                setattr(parent, parent_attr, cloud)
+    elif cloud is not None:
+        # Insert the new route below existing security/telemetry wrappers.
         engine_name = getattr(request.app.state, "engine_name", "local")
         new_multi = MultiEngine([(engine_name, inner), ("cloud", cloud)])
-        if hasattr(outer, wrapper_attr):
-            setattr(outer, wrapper_attr, new_multi)
-        else:
+        if parent is None:
             request.app.state.engine = new_multi
+        else:
+            setattr(parent, parent_attr, new_multi)
         request.app.state.engine_name = "multi"
 
+    if build_error is not None:
+        return {"status": "error", "message": str(build_error)}
+    if cloud is None:
+        return {
+            "status": "no_cloud",
+            "message": "No cloud models available (check API keys)",
+        }
     return {"status": "ok", "message": "Cloud engine reloaded"}
 
 

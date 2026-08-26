@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from types import SimpleNamespace
 from unittest import mock
 
@@ -590,6 +591,29 @@ class TestOxAlphaFreeRouting:
         assert result == ["ok"]
 
     @pytest.mark.asyncio
+    async def test_stream_offloads_fail_closed_buffering(self) -> None:
+        engine, client = self._engine(iter(()))
+        caller_thread = threading.get_ident()
+        worker_threads: list[int] = []
+
+        def create(**kwargs):
+            worker_threads.append(threading.get_ident())
+            return iter(self._stream_chunks())
+
+        client.chat.completions.create.side_effect = create
+
+        result = [
+            token
+            async for token in engine.stream(
+                [Message(role=Role.USER, content="Hi")],
+                model="openrouter/stealth/ox-alpha",
+            )
+        ]
+
+        assert result == ["ok"]
+        assert worker_threads and worker_threads[0] != caller_thread
+
+    @pytest.mark.asyncio
     async def test_stream_rejects_nonzero_final_cost(self) -> None:
         engine, _ = self._engine(iter(self._stream_chunks(cost=0.01)))
         stream = engine.stream(
@@ -635,6 +659,29 @@ class TestOxAlphaFreeRouting:
             "completion_tokens": 2,
             "total_tokens": 5,
         }
+
+    @pytest.mark.asyncio
+    async def test_stream_full_offloads_fail_closed_buffering(self) -> None:
+        engine, client = self._engine(iter(()))
+        caller_thread = threading.get_ident()
+        worker_threads: list[int] = []
+
+        def create(**kwargs):
+            worker_threads.append(threading.get_ident())
+            return iter(self._stream_chunks())
+
+        client.chat.completions.create.side_effect = create
+
+        result = [
+            chunk
+            async for chunk in engine.stream_full(
+                [Message(role=Role.USER, content="Hi")],
+                model="openrouter/stealth/ox-alpha",
+            )
+        ]
+
+        assert result[0].content == "ok"
+        assert worker_threads and worker_threads[0] != caller_thread
 
 
 class TestCloudEngineCanServe:
