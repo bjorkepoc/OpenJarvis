@@ -536,12 +536,15 @@ class TestOxAlphaFreeRouting:
             SimpleNamespace(choices=[], usage=cls._usage(cost), model=model),
         ]
 
-    def test_generate_enforces_free_private_route(self) -> None:
+    @pytest.mark.parametrize(
+        "model", ["openrouter/stealth/ox-alpha", "stealth/ox-alpha"]
+    )
+    def test_generate_enforces_free_private_route(self, model: str) -> None:
         engine, client = self._engine(self._response())
 
         result = engine.generate(
             [Message(role=Role.USER, content="Hi")],
-            model="openrouter/stealth/ox-alpha",
+            model=model,
         )
 
         self._assert_free_policy(client)
@@ -569,14 +572,17 @@ class TestOxAlphaFreeRouting:
             )
 
     @pytest.mark.asyncio
-    async def test_stream_enforces_and_audits_free_route(self) -> None:
+    @pytest.mark.parametrize(
+        "model", ["openrouter/stealth/ox-alpha", "stealth/ox-alpha"]
+    )
+    async def test_stream_enforces_and_audits_free_route(self, model: str) -> None:
         engine, client = self._engine(iter(self._stream_chunks()))
 
         result = [
             token
             async for token in engine.stream(
                 [Message(role=Role.USER, content="Hi")],
-                model="openrouter/stealth/ox-alpha",
+                model=model,
             )
         ]
 
@@ -586,25 +592,39 @@ class TestOxAlphaFreeRouting:
     @pytest.mark.asyncio
     async def test_stream_rejects_nonzero_final_cost(self) -> None:
         engine, _ = self._engine(iter(self._stream_chunks(cost=0.01)))
+        stream = engine.stream(
+            [Message(role=Role.USER, content="Hi")],
+            model="openrouter/stealth/ox-alpha",
+        )
 
         with pytest.raises(EngineConnectionError):
-            _ = [
-                token
-                async for token in engine.stream(
-                    [Message(role=Role.USER, content="Hi")],
-                    model="openrouter/stealth/ox-alpha",
-                )
-            ]
+            await anext(stream)
 
     @pytest.mark.asyncio
-    async def test_stream_full_enforces_and_audits_free_route(self) -> None:
+    async def test_stream_rejects_model_change_before_yielding(self) -> None:
+        chunks = self._stream_chunks()
+        chunks[0].model = "paid/substitute"
+        engine, _ = self._engine(iter(chunks))
+        stream = engine.stream(
+            [Message(role=Role.USER, content="Hi")],
+            model="openrouter/stealth/ox-alpha",
+        )
+
+        with pytest.raises(EngineConnectionError):
+            await anext(stream)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "model", ["openrouter/stealth/ox-alpha", "stealth/ox-alpha"]
+    )
+    async def test_stream_full_enforces_and_audits_free_route(self, model: str) -> None:
         engine, client = self._engine(iter(self._stream_chunks()))
 
         result = [
             chunk
             async for chunk in engine.stream_full(
                 [Message(role=Role.USER, content="Hi")],
-                model="openrouter/stealth/ox-alpha",
+                model=model,
             )
         ]
 

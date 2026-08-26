@@ -144,12 +144,16 @@ def _is_deepseek_model(model: str) -> bool:
     return model.lower().startswith("deepseek")
 
 
+def _is_ox_alpha_model(model: str) -> bool:
+    return model in (_OX_ALPHA_MODEL, _OX_ALPHA_API_MODEL)
+
+
 def _is_openrouter_model(model: str) -> bool:
-    return model.startswith("openrouter/")
+    return model.startswith("openrouter/") or _is_ox_alpha_model(model)
 
 
 def _ox_alpha_request_options(model: str) -> Dict[str, Any]:
-    if model != _OX_ALPHA_MODEL:
+    if not _is_ox_alpha_model(model):
         return {}
     return {
         "extra_body": {
@@ -158,13 +162,19 @@ def _ox_alpha_request_options(model: str) -> Dict[str, Any]:
     }
 
 
-def _validate_ox_alpha_response(model: str, response_model: Any, usage: Any) -> float:
-    if model != _OX_ALPHA_MODEL:
-        return 0.0
+def _validate_ox_alpha_model(model: str, response_model: Any) -> None:
+    if not _is_ox_alpha_model(model):
+        return
     if response_model != _OX_ALPHA_API_MODEL:
         raise EngineConnectionError(
             f"OpenRouter returned unexpected Ox Alpha model: {response_model!r}"
         )
+
+
+def _validate_ox_alpha_response(model: str, response_model: Any, usage: Any) -> float:
+    if not _is_ox_alpha_model(model):
+        return 0.0
+    _validate_ox_alpha_model(model, response_model)
     cost = (
         usage.get("cost") if isinstance(usage, dict) else getattr(usage, "cost", None)
     )
@@ -1026,7 +1036,7 @@ class CloudEngine(InferenceEngine):
             "finish_reason": choice.finish_reason or "stop",
             "ttft": elapsed,
         }
-        if model == _OX_ALPHA_MODEL:
+        if _is_ox_alpha_model(model):
             result["cost_usd"] = cost_usd
         if getattr(choice.message, "tool_calls", None):
             result["tool_calls"] = [
@@ -1545,13 +1555,20 @@ class CloudEngine(InferenceEngine):
         resp = self._openrouter_client.chat.completions.create(**create_kwargs)
         response_model: Any = None
         final_usage: Any = None
+        pending: List[str] = []
         for chunk in resp:
             response_model = getattr(chunk, "model", response_model)
             final_usage = getattr(chunk, "usage", None) or final_usage
+            _validate_ox_alpha_model(model, response_model)
             delta = chunk.choices[0].delta if chunk.choices else None
             if delta and delta.content:
-                yield delta.content
+                if _is_ox_alpha_model(model):
+                    pending.append(delta.content)
+                else:
+                    yield delta.content
         _validate_ox_alpha_response(model, response_model, final_usage)
+        for token in pending:
+            yield token
 
     async def _stream_minimax(
         self,
@@ -1685,10 +1702,12 @@ class CloudEngine(InferenceEngine):
         resp = client.chat.completions.create(**create_kwargs)
         response_model: Any = None
         final_usage: Any = None
+        pending: List[StreamChunk] = []
         for chunk in resp:
-            if model == _OX_ALPHA_MODEL:
+            if _is_ox_alpha_model(model):
                 response_model = getattr(chunk, "model", response_model)
                 final_usage = getattr(chunk, "usage", None) or final_usage
+                _validate_ox_alpha_model(model, response_model)
             choice = chunk.choices[0] if chunk.choices else None
             if not choice:
                 continue
@@ -1711,13 +1730,19 @@ class CloudEngine(InferenceEngine):
                 ]
             finish = choice.finish_reason
             if content or tool_calls or finish:
-                yield StreamChunk(
+                stream_chunk = StreamChunk(
                     content=content,
                     tool_calls=tool_calls,
                     finish_reason=finish,
                 )
-        if model == _OX_ALPHA_MODEL:
+                if _is_ox_alpha_model(model):
+                    pending.append(stream_chunk)
+                else:
+                    yield stream_chunk
+        if _is_ox_alpha_model(model):
             _validate_ox_alpha_response(model, response_model, final_usage)
+            for stream_chunk in pending:
+                yield stream_chunk
             yield StreamChunk(
                 usage={
                     "prompt_tokens": final_usage.prompt_tokens,

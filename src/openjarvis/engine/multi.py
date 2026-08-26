@@ -44,6 +44,10 @@ class MultiEngine(InferenceEngine):
 
     def _engine_for(self, model: str) -> InferenceEngine:
         """Find the engine that owns a model, refreshing the map once if needed."""
+        if model == "stealth/ox-alpha":
+            for key, engine in self._engines:
+                if key == "cloud":
+                    return engine
         engine = self._model_map.get(model)
         if engine is not None:
             return engine

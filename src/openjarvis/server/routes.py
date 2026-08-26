@@ -451,9 +451,14 @@ def _engine_key_for_model(engine: Any, model: str) -> str | None:
 
 def _uses_direct_cloud_router(engine: Any, model: str) -> bool:
     """Whether *model* should bypass the configured engine for direct cloud."""
+    from openjarvis.engine.cloud import _is_ox_alpha_model
     from openjarvis.server.cloud_router import is_cloud_model
 
-    return is_cloud_model(model) and _engine_key_for_model(engine, model) != "litellm"
+    return (
+        is_cloud_model(model)
+        and not _is_ox_alpha_model(model)
+        and _engine_key_for_model(engine, model) != "litellm"
+    )
 
 
 def _handle_direct(
@@ -986,12 +991,19 @@ async def _handle_stream(
                 # accidentally matched.
                 _use_local_fallback = False
                 try:
+                    from openjarvis.engine.cloud import _is_ox_alpha_model
                     from openjarvis.engine.multi import MultiEngine
 
-                    _inner = getattr(engine, "_inner", engine)
+                    _inner = getattr(
+                        engine, "_engine", getattr(engine, "_inner", engine)
+                    )
                     if isinstance(_inner, MultiEngine):
                         _routed = _inner._engine_for(model)
-                        if _routed is not None and getattr(_routed, "is_cloud", False):
+                        if (
+                            _routed is not None
+                            and getattr(_routed, "is_cloud", False)
+                            and not _is_ox_alpha_model(model)
+                        ):
                             _use_local_fallback = True
                 except Exception:
                     pass
@@ -1257,6 +1269,7 @@ async def reload_cloud_engine(request: Request):
     try:
         from openjarvis.engine.cloud import CloudEngine
         from openjarvis.engine.multi import MultiEngine
+        from openjarvis.security.guardrails import GuardrailsEngine
 
         cloud = CloudEngine()
         if not cloud.health():
@@ -1267,9 +1280,10 @@ async def reload_cloud_engine(request: Request):
     except Exception as exc:
         return {"status": "error", "message": str(exc)}
 
-    # Locate the innermost engine, working through InstrumentedEngine layers.
+    # Locate the routed engine without discarding its security/telemetry wrapper.
     outer = request.app.state.engine
-    inner = getattr(outer, "_inner", outer)
+    wrapper_attr = "_engine" if isinstance(outer, GuardrailsEngine) else "_inner"
+    inner = getattr(outer, wrapper_attr, outer)
 
     if isinstance(inner, MultiEngine):
         # Replace or insert the cloud entry in the existing MultiEngine.
@@ -1282,8 +1296,8 @@ async def reload_cloud_engine(request: Request):
         # MultiEngine that includes the cloud engine.
         engine_name = getattr(request.app.state, "engine_name", "local")
         new_multi = MultiEngine([(engine_name, inner), ("cloud", cloud)])
-        if hasattr(outer, "_inner"):
-            outer._inner = new_multi
+        if hasattr(outer, wrapper_attr):
+            setattr(outer, wrapper_attr, new_multi)
         else:
             request.app.state.engine = new_multi
         request.app.state.engine_name = "multi"

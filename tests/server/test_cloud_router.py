@@ -13,7 +13,7 @@ from openjarvis.server import cloud_router
 
 
 def _mock_openrouter_stream(
-    monkeypatch, *, model="stealth/ox-alpha", cost=0
+    monkeypatch, *, model="stealth/ox-alpha", first_model=None, cost=0
 ) -> dict[str, dict]:
     captured: dict[str, dict] = {}
     events = "\n\n".join(
@@ -21,7 +21,7 @@ def _mock_openrouter_stream(
             "data: "
             + json.dumps(
                 {
-                    "model": model,
+                    "model": first_model or model,
                     "choices": [{"delta": {"content": "ok"}}],
                 }
             ),
@@ -137,13 +137,24 @@ async def test_direct_ox_stream_rejects_nonzero_cost(monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
     _mock_openrouter_stream(monkeypatch, cost=0.01)
 
+    stream = cloud_router.stream_cloud(
+        "openrouter/stealth/ox-alpha", [Message(role="user", content="hi")]
+    )
+
     with pytest.raises(EngineConnectionError):
-        _ = [
-            token
-            async for token in cloud_router.stream_cloud(
-                "openrouter/stealth/ox-alpha", [Message(role="user", content="hi")]
-            )
-        ]
+        await anext(stream)
+
+
+@pytest.mark.asyncio
+async def test_direct_ox_stream_rejects_model_change_before_yielding(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    _mock_openrouter_stream(monkeypatch, first_model="paid/substitute")
+    stream = cloud_router.stream_cloud(
+        "openrouter/stealth/ox-alpha", [Message(role="user", content="hi")]
+    )
+
+    with pytest.raises(EngineConnectionError):
+        await anext(stream)
 
 
 @pytest.mark.asyncio

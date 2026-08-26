@@ -538,12 +538,13 @@ class TestChatCompletions:
     def test_multi_engine_local_fallback_reports_actual_ollama_route(self):
         """Finish telemetry follows the backend that produced the tokens."""
         from openjarvis.engine.multi import MultiEngine
+        from openjarvis.security.guardrails import GuardrailsEngine
 
         routed_cloud = MagicMock()
         routed_cloud.is_cloud = True
         routed_cloud.list_models.return_value = ["qwen3:8b"]
         routed_cloud.health.return_value = True
-        engine = MultiEngine([("cloud", routed_cloud)])
+        engine = GuardrailsEngine(MultiEngine([("cloud", routed_cloud)]), scanners=[])
 
         async def local_stream(model, messages, temperature, max_tokens):
             yield "actual-local"
@@ -1531,6 +1532,63 @@ class TestModelsEndpoint:
         stream_cloud.assert_not_called()
         assert "Hello" in resp.text
         assert '"engine": "litellm"' in resp.text
+
+    @pytest.mark.parametrize(
+        "model", ["openrouter/stealth/ox-alpha", "stealth/ox-alpha"]
+    )
+    def test_ox_streams_through_guarded_engine(self, model):
+        engine = _make_engine(models=[model])
+        engine.engine_id = "cloud"
+        app = create_app(
+            engine,
+            model,
+            engine_name="cloud",
+            config=_test_config(),
+        )
+
+        async def direct_cloud_tokens():
+            yield "wrong backend"
+
+        with patch(
+            "openjarvis.server.cloud_router.stream_cloud",
+            return_value=direct_cloud_tokens(),
+        ) as stream_cloud:
+            client = TestClient(app)
+            resp = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": True,
+                },
+            )
+
+        assert resp.status_code == 200
+        stream_cloud.assert_not_called()
+        assert "Hello" in resp.text
+
+    def test_cloud_reload_preserves_guardrail_wrapper(self, monkeypatch):
+        from openjarvis.engine.multi import MultiEngine
+        from openjarvis.security.guardrails import GuardrailsEngine
+
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+        guarded = GuardrailsEngine(_make_engine(), scanners=[])
+        app = create_app(
+            guarded,
+            "test-model",
+            engine_name="mock",
+            config=_test_config(),
+        )
+
+        resp = TestClient(app).post(
+            "/v1/cloud/reload",
+            json={"keys": {"OPENROUTER_API_KEY": "test-key"}},
+        )
+
+        assert resp.status_code == 200
+        assert isinstance(app.state.engine, GuardrailsEngine)
+        assert isinstance(app.state.engine._engine, MultiEngine)
 
 
 # ---------------------------------------------------------------------------

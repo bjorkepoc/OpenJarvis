@@ -193,12 +193,6 @@ def serve(
 
     engine_name, engine = resolved
 
-    # Apply security guardrails
-    from openjarvis.security import setup_security
-
-    sec = setup_security(config, engine, bus)
-    engine = sec.engine
-
     # If cloud API keys are set, prepare a cloud engine. We build the
     # MultiEngine after local discovery so healthy local fallbacks such as
     # Ollama stay visible even when the configured preferred engine is MLX.
@@ -268,6 +262,13 @@ def serve(
         engine_name = "multi"
         all_models[engine_name] = engine.list_models()
         merge_discovered_models(engine_name, all_models[engine_name])
+
+    # Apply one guardrail wrapper after routing is complete so cloud and
+    # discovered engines cannot bypass the configured input policy.
+    from openjarvis.security import setup_security
+
+    sec = setup_security(config, engine, bus)
+    engine = sec.engine
 
     # Resolve model
     configured_model = (
