@@ -49,6 +49,7 @@ class MultiEngine(InferenceEngine):
             for key, engine in self._engines:
                 if key == "cloud":
                     return engine
+            raise ValueError("Ox Alpha requires the cloud engine")
         engine = self._model_map.get(model)
         if engine is not None:
             return engine
@@ -131,6 +132,7 @@ class MultiEngine(InferenceEngine):
             for key, _engine in self._engines:
                 if key == "cloud":
                     return key
+            return None
         key = self._model_key_map.get(model)
         if key is not None:
             return key

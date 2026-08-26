@@ -119,6 +119,17 @@ def test_multi_routes_bare_ox_alias_to_guarded_cloud_engine():
     assert multi.engine_key_for("stealth/ox-alpha") == "cloud"
 
 
+@pytest.mark.parametrize("model", ["openrouter/stealth/ox-alpha", "stealth/ox-alpha"])
+def test_multi_rejects_ox_without_cloud_engine(model: str):
+    unsafe = _FakeStreamFullEngine([])
+    unsafe.list_models = lambda: [model]
+    multi = MultiEngine([("litellm", unsafe)])
+
+    with pytest.raises(ValueError, match="requires the cloud engine"):
+        multi._engine_for(model)
+    assert multi.engine_key_for(model) is None
+
+
 @pytest.mark.asyncio
 async def test_multi_routes_stream_full_by_model():
     """MultiEngine routes stream_full to the correct engine by model name."""
