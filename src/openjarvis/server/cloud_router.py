@@ -16,6 +16,12 @@ import httpx
 
 from openjarvis.core.paths import get_config_dir
 from openjarvis.core.types import Message
+from openjarvis.engine.cloud import (
+    _OX_ALPHA_API_MODEL,
+    _OX_ALPHA_MODEL,
+    _OX_ALPHA_PROVIDER_POLICY,
+    _validate_ox_alpha_response,
+)
 
 # ---------------------------------------------------------------------------
 # Key / provider detection
@@ -154,6 +160,7 @@ async def _stream_openai(
     max_tokens: int,
     base_url: str = "https://api.openai.com/v1",
     api_key_name: str = "OPENAI_API_KEY",
+    requested_model: str | None = None,
 ) -> AsyncIterator[str]:
     keys = _load_keys()
     api_key = keys.get(api_key_name, "")
@@ -167,6 +174,9 @@ async def _stream_openai(
         "max_tokens": max_tokens,
         "stream": True,
     }
+    is_ox_alpha = requested_model in (_OX_ALPHA_MODEL, _OX_ALPHA_API_MODEL)
+    if is_ox_alpha:
+        payload["provider"] = _OX_ALPHA_PROVIDER_POLICY
 
     async with httpx.AsyncClient(timeout=180) as client:
         async with client.stream(
@@ -179,6 +189,8 @@ async def _stream_openai(
             },
         ) as resp:
             resp.raise_for_status()
+            response_model: Any = None
+            final_usage: Any = None
             async for line in resp.aiter_lines():
                 if not line.startswith("data: "):
                     continue
@@ -187,11 +199,18 @@ async def _stream_openai(
                     break
                 try:
                     chunk = json.loads(data)
+                    if is_ox_alpha:
+                        response_model = chunk.get("model", response_model)
+                        final_usage = chunk.get("usage") or final_usage
                     delta = chunk["choices"][0]["delta"].get("content") or ""
                     if delta:
                         yield delta
                 except Exception:
                     pass
+            if is_ox_alpha:
+                _validate_ox_alpha_response(
+                    _OX_ALPHA_MODEL, response_model, final_usage
+                )
 
 
 async def _stream_anthropic(
@@ -388,6 +407,7 @@ async def stream_cloud(
             max_tokens,
             base_url="https://openrouter.ai/api/v1",
             api_key_name="OPENROUTER_API_KEY",
+            requested_model=model,
         ):
             yield token
 

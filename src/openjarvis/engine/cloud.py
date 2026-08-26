@@ -102,6 +102,17 @@ _DEEPSEEK_MODELS = [
 # OpenRouter models — prefixed with "openrouter/" so they can be identified
 _OX_ALPHA_MODEL = "openrouter/stealth/ox-alpha"
 _OX_ALPHA_API_MODEL = "stealth/ox-alpha"
+_OX_ALPHA_PROVIDER_POLICY = {
+    "allow_fallbacks": False,
+    "data_collection": "deny",
+    "zdr": True,
+    "max_price": {
+        "prompt": 0,
+        "completion": 0,
+        "request": 0,
+        "image": 0,
+    },
+}
 _OPENROUTER_POPULAR = [
     _OX_ALPHA_MODEL,
     "openrouter/auto",
@@ -142,17 +153,7 @@ def _ox_alpha_request_options(model: str) -> Dict[str, Any]:
         return {}
     return {
         "extra_body": {
-            "provider": {
-                "allow_fallbacks": False,
-                "data_collection": "deny",
-                "zdr": True,
-                "max_price": {
-                    "prompt": 0,
-                    "completion": 0,
-                    "request": 0,
-                    "image": 0,
-                },
-            }
+            "provider": _OX_ALPHA_PROVIDER_POLICY,
         }
     }
 
@@ -164,7 +165,9 @@ def _validate_ox_alpha_response(model: str, response_model: Any, usage: Any) -> 
         raise EngineConnectionError(
             f"OpenRouter returned unexpected Ox Alpha model: {response_model!r}"
         )
-    cost = getattr(usage, "cost", None)
+    cost = (
+        usage.get("cost") if isinstance(usage, dict) else getattr(usage, "cost", None)
+    )
     if isinstance(cost, bool) or not isinstance(cost, (int, float)) or cost != 0:
         raise EngineConnectionError(
             f"OpenRouter returned non-zero or invalid Ox Alpha cost: {cost!r}"
