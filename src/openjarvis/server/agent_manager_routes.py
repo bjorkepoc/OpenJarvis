@@ -73,6 +73,13 @@ def _create_from_managed_template(
     return manager.create_agent(name=name, agent_type=agent_type, config=config)
 
 
+def _register_agent_schedule(app_state: Any, agent: Dict[str, Any]) -> None:
+    scheduler = getattr(app_state, "agent_scheduler", None)
+    schedule_type = (agent.get("config", {}) or {}).get("schedule_type", "manual")
+    if scheduler and schedule_type in ("cron", "interval"):
+        scheduler.register_agent(agent["id"])
+
+
 def _get_runtime_event_bus(runtime: Any = None) -> Any:
     """Return the server-owned event bus, falling back outside app runtimes."""
 
@@ -1632,11 +1639,7 @@ def create_agent_manager_router(
                 name=req.name, agent_type=req.agent_type, config=req.config
             )
 
-        # Register with scheduler if cron/interval
-        scheduler = getattr(request.app.state, "agent_scheduler", None)
-        sched_type = (req.config or {}).get("schedule_type", "manual")
-        if scheduler and sched_type in ("cron", "interval"):
-            scheduler.register_agent(agent["id"])
+        _register_agent_schedule(request.app.state, agent)
 
         return agent
 
@@ -1830,9 +1833,8 @@ def create_agent_manager_router(
         agent_record = manager.get_agent(agent_id)
         if not agent_record:
             raise HTTPException(status_code=404, detail="Agent not found")
-        _require_managed_agent_model(
-            _managed_agent_model(agent_record, request.app.state)
-        )
+        managed_model = _managed_agent_model(agent_record, request.app.state)
+        _require_managed_agent_model(managed_model)
         _require_managed_agent_model(str(getattr(request.app.state, "model", "") or ""))
         _require_managed_agent_model(
             str(
@@ -1940,14 +1942,9 @@ def create_agent_manager_router(
                                     DeepResearchAgent,
                                 )
 
-                                model_name = getattr(engine, "_model", "") or getattr(
-                                    request.app.state,
-                                    "model",
-                                    "",
-                                )
                                 dr_agent = DeepResearchAgent(
                                     engine=engine,
-                                    model=model_name,
+                                    model=managed_model,
                                     tools=tools,
                                     interactive=True,
                                     confirm_callback=lambda _prompt: True,
@@ -2281,13 +2278,15 @@ def create_agent_manager_router(
         req: CreateAgentRequest,
         request: Request,
     ):
-        return _create_from_managed_template(
+        agent = _create_from_managed_template(
             manager,
             template_id,
             req.name,
             req.config,
             request.app.state,
         )
+        _register_agent_schedule(request.app.state, agent)
+        return agent
 
     # ── Global agent endpoints ───────────────────────────────
 

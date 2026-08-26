@@ -946,6 +946,7 @@ fn check_jarvis_port_available() -> Result<(), String> {
 // ---------------------------------------------------------------------------
 
 async fn boot_backend(backend: SharedBackend, status: SharedStatus) {
+    migrate_legacy_cloud_keys(&backend).await;
     // Decide the inference source (default Ollama) before launching anything.
     let cfg = read_inference_config();
     let plan = boot_plan(&cfg, total_ram_gb());
@@ -2096,7 +2097,8 @@ fn read_legacy_cloud_keys() -> Vec<(String, String)> {
     keys
 }
 
-fn migrate_legacy_cloud_keys() {
+async fn migrate_legacy_cloud_keys(backend: &SharedBackend) {
+    let _manager = backend.lock().await;
     let path = legacy_cloud_keys_path();
     if !path.exists() {
         return;
@@ -2125,7 +2127,6 @@ fn migrate_legacy_cloud_keys() {
 
 /// Read cloud keys from secure desktop storage and return key=value pairs.
 fn read_cloud_keys() -> Vec<(String, String)> {
-    migrate_legacy_cloud_keys();
     managed_cloud_key_names()
         .into_iter()
         .filter_map(|key| match secure_store_get(&key) {
@@ -2196,12 +2197,98 @@ fn jarvis_reload_target(
     }
 }
 
-fn jarvis_server_present() -> bool {
+fn server_present_on(port: u16) -> bool {
     // Port occupancy is a safer liveness signal than an HTTP timeout here:
     // an overloaded attached server can still own the port even when /health
     // does not answer quickly. Treat any listener as live and require reload
     // confirmation rather than returning a false offline success.
-    check_jarvis_port_available().is_err()
+    std::net::TcpListener::bind(("127.0.0.1", port)).is_err()
+}
+
+async fn persist_api_key_change_with<S, R, Fut>(
+    key_name: String,
+    key_value: String,
+    backend: &SharedBackend,
+    can_hot_reload: bool,
+    store: S,
+    server_port: u16,
+    reload: R,
+) -> Result<Option<String>, String>
+where
+    S: FnOnce(&str, &str) -> Result<(), String>,
+    R: FnOnce(Vec<(String, String)>) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    let mut manager = backend.lock().await;
+    store(&key_name, &key_value)?;
+
+    let child_state = manager
+        .jarvis
+        .as_mut()
+        .map(|handle| handle.child.try_wait());
+    let owns_running_child = match child_state {
+        Some(Ok(None)) => true,
+        Some(Ok(Some(_))) => {
+            manager.jarvis = None;
+            false
+        }
+        Some(Err(error)) => {
+            manager.stop_all().await;
+            return Ok(Some(format!(
+                "API key saved, but managed backend state could not be verified ({error}); backend stopped and must be restarted"
+            )));
+        }
+        None => false,
+    };
+    let target = jarvis_reload_target(
+        owns_running_child,
+        manager.jarvis_attached,
+        !owns_running_child
+            && !manager.jarvis_attached
+            && server_present_on(server_port),
+    );
+
+    match target {
+        JarvisReloadTarget::Offline => Ok(None),
+        JarvisReloadTarget::Attached => Ok(Some(
+            "API key saved, but the attached or external backend must be restarted before continuing"
+                .to_string(),
+        )),
+        JarvisReloadTarget::Managed if !can_hot_reload => {
+            manager.stop_all().await;
+            Ok(Some(
+                "API key saved; backend stopped and must be restarted before continuing"
+                    .to_string(),
+            ))
+        }
+        JarvisReloadTarget::Managed => {
+            if let Err(error) = reload(vec![(key_name, key_value)]).await {
+                manager.stop_all().await;
+                return Ok(Some(format!(
+                    "{error}; backend stopped to prevent use of stale credentials"
+                )));
+            }
+            Ok(None)
+        }
+    }
+}
+
+async fn persist_api_key_change(
+    key_name: String,
+    key_value: String,
+    backend: &SharedBackend,
+    can_hot_reload: bool,
+) -> Result<Option<String>, String> {
+    persist_api_key_change_with(
+        key_name,
+        key_value,
+        backend,
+        can_hot_reload,
+        secure_store_set,
+        JARVIS_PORT,
+        reload_cloud_keys,
+    )
+    .await
 }
 
 /// Save a single cloud API key to secure desktop storage.
@@ -2220,60 +2307,16 @@ async fn save_cloud_key_inner(
     backend: &SharedBackend,
 ) -> Result<(), String> {
     let key_value = key_value.trim().to_string();
-
-    // Tool credentials and custom OpenAI-compatible endpoint keys are read
-    // independently. They must not ask CloudEngine to reload or interpret a
-    // legitimate `no_cloud` response as a failed save.
-    if !cloud_key_requires_reload(&key_name) {
-        secure_store_set(&key_name, &key_value)?;
-        return Ok(());
+    let can_hot_reload = cloud_key_requires_reload(&key_name);
+    match persist_api_key_change(key_name, key_value, backend, can_hot_reload).await? {
+        Some(restart_required) => Err(restart_required),
+        None => Ok(()),
     }
-
-    let (owns_child, known_attached) = {
-        let manager = backend.lock().await;
-        // Serialized with spawn_managed_jarvis(): either this write wins and
-        // the child snapshots it, or the child is registered before we decide
-        // whether a live reload is required.
-        secure_store_set(&key_name, &key_value)?;
-        (manager.jarvis.is_some(), manager.jarvis_attached)
-    };
-    let server_reachable = if owns_child || known_attached {
-        false
-    } else {
-        jarvis_server_present()
-    };
-    let reload_target =
-        jarvis_reload_target(owns_child, known_attached, server_reachable);
-
-    // During first-run setup the server has not started yet, so there is no
-    // in-memory credential to revoke or rotate. Boot reads the secure store.
-    if reload_target == JarvisReloadTarget::Offline {
-        return Ok(());
-    }
-
-    // Tell the running server to hot-reload its cloud engine so the user
-    // doesn't need to restart the app after entering an API key.
-    if let Err(error) = reload_cloud_keys(vec![(key_name, key_value)]).await {
-        if reload_target == JarvisReloadTarget::Managed {
-            backend.lock().await.stop_all().await;
-            return Err(format!(
-                "{}; backend stopped to prevent use of stale credentials",
-                error
-            ));
-        }
-        return Err(format!(
-            "{}; attached backend did not confirm the credential reload — restart it before continuing",
-            error
-        ));
-    }
-
-    Ok(())
 }
 
 /// Get which cloud providers have keys configured (without exposing values).
 #[tauri::command]
 async fn get_cloud_key_status() -> Result<serde_json::Value, String> {
-    migrate_legacy_cloud_keys();
     let status: Vec<serde_json::Value> = managed_cloud_key_names()
         .into_iter()
         .map(|key| {
@@ -2300,6 +2343,7 @@ async fn set_inference_source(
     host: Option<String>,
     engine: Option<String>,
     api_key: Option<String>,
+    backend: tauri::State<'_, SharedBackend>,
 ) -> Result<(), String> {
     let kind = match kind.as_str() {
         "ollama" => SourceKind::Ollama,
@@ -2312,6 +2356,7 @@ async fn set_inference_source(
         host: host.map(|h| normalize_host(&h)).filter(|h| !h.is_empty()),
         engine: engine.filter(|e| !e.is_empty()),
     };
+    let mut restart_required = None;
     if let SourceKind::Custom = cfg.kind {
         if cfg.host.is_none() {
             return Err("A server URL is required for a custom endpoint.".into());
@@ -2328,11 +2373,21 @@ async fn set_inference_source(
             // Save the key before persisting the config: if the key can't be
             // written, surface it and DON'T record a custom source whose
             // credential is missing (which would fail confusingly at runtime).
-            secure_store_set(&key_name, key.trim())
-                .map_err(|e| format!("Could not store the API key: {}", e))?;
+            restart_required = persist_api_key_change(
+                key_name,
+                key.trim().to_string(),
+                backend.inner(),
+                false,
+            )
+            .await
+            .map_err(|e| format!("Could not store the API key: {}", e))?;
         }
     }
-    write_inference_config(&cfg)
+    write_inference_config(&cfg)?;
+    match restart_required {
+        Some(message) => Err(message),
+        None => Ok(()),
+    }
 }
 
 /// Pull a model via Ollama (called from frontend download button).
@@ -3113,6 +3168,134 @@ mod tests {
         manager.stop_all().await;
     }
 
+    #[tokio::test]
+    async fn foreign_listener_receives_no_key_even_after_owned_child_exits() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let backend = std::sync::Arc::new(tokio::sync::Mutex::new(
+            BackendManager::default(),
+        ));
+        let mut cmd = tokio::process::Command::new(HARMLESS_BIN);
+        cmd.stderr(std::process::Stdio::piped());
+        super::spawn_managed_jarvis(&backend, &mut cmd, Vec::new)
+            .await
+            .unwrap();
+        backend
+            .lock()
+            .await
+            .jarvis
+            .as_mut()
+            .unwrap()
+            .child
+            .wait()
+            .await
+            .unwrap();
+        let reload_called = std::sync::Arc::new(AtomicBool::new(false));
+        let reload_probe = reload_called.clone();
+
+        let result = super::persist_api_key_change_with(
+            "OPENROUTER_API_KEY".to_string(),
+            "secret".to_string(),
+            &backend,
+            true,
+            |_key, _value| Ok(()),
+            port,
+            move |_keys| {
+                let reload_probe = reload_probe.clone();
+                async move {
+                    reload_probe.store(true, Ordering::SeqCst);
+                    Ok(())
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(result.unwrap().contains("external backend"));
+        assert!(!reload_called.load(Ordering::SeqCst));
+        assert!(matches!(
+            listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        assert!(backend.lock().await.jarvis.is_none());
+
+        backend.lock().await.jarvis_attached = true;
+        let attached = super::persist_api_key_change_with(
+            "TAVILY_API_KEY".to_string(),
+            "secret".to_string(),
+            &backend,
+            false,
+            |_key, _value| Ok(()),
+            0,
+            |_keys| async { panic!("attached backends must not receive keys") },
+        )
+        .await
+        .unwrap();
+        assert!(attached.unwrap().contains("attached"));
+        assert!(backend.lock().await.jarvis_attached);
+    }
+
+    #[tokio::test]
+    async fn non_reloadable_updates_share_spawn_lock_and_replace_stale_env() {
+        for value in ["rotated", ""] {
+            let backend = std::sync::Arc::new(tokio::sync::Mutex::new(
+                BackendManager::default(),
+            ));
+            let stored = std::sync::Arc::new(std::sync::Mutex::new("old".to_string()));
+            let mut cmd = long_running_command();
+            cmd.stderr(std::process::Stdio::piped());
+            let initial = stored.clone();
+            super::spawn_managed_jarvis(&backend, &mut cmd, || {
+                vec![(
+                    "TAVILY_API_KEY".to_string(),
+                    initial.lock().unwrap().clone(),
+                )]
+            })
+            .await
+            .unwrap();
+
+            let store_probe = stored.clone();
+            let lock_probe = backend.clone();
+            let result = super::persist_api_key_change_with(
+                "TAVILY_API_KEY".to_string(),
+                value.to_string(),
+                &backend,
+                false,
+                move |_key, value| {
+                    assert!(lock_probe.try_lock().is_err());
+                    *store_probe.lock().unwrap() = value.to_string();
+                    Ok(())
+                },
+                0,
+                |_keys| async { panic!("non-reloadable keys must not be sent") },
+            )
+            .await
+            .unwrap();
+
+            assert!(result.unwrap().contains("backend stopped"));
+            assert_eq!(*stored.lock().unwrap(), value);
+            assert!(backend.lock().await.jarvis.is_none());
+
+            let snapshot = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+            let snapshot_probe = snapshot.clone();
+            let stored_probe = stored.clone();
+            let mut cmd = long_running_command();
+            cmd.stderr(std::process::Stdio::piped());
+            super::spawn_managed_jarvis(&backend, &mut cmd, move || {
+                *snapshot_probe.lock().unwrap() = stored_probe.lock().unwrap().clone();
+                Vec::new()
+            })
+            .await
+            .unwrap();
+
+            assert_eq!(*snapshot.lock().unwrap(), value);
+            backend.lock().await.stop_all().await;
+        }
+    }
+
     #[test]
     fn tail_returns_whole_string_when_shorter_than_limit() {
         assert_eq!(uv_sync_stderr_tail("short error", 800), "short error");
@@ -3486,6 +3669,21 @@ mod tests {
     const HARMLESS_BIN: &str = "cmd";
     #[cfg(not(target_os = "windows"))]
     const HARMLESS_BIN: &str = "/usr/bin/true";
+
+    fn long_running_command() -> tokio::process::Command {
+        #[cfg(target_os = "windows")]
+        {
+            let mut cmd = tokio::process::Command::new("cmd");
+            cmd.args(["/C", "timeout", "/T", "30", "/NOBREAK"]);
+            cmd
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let mut cmd = tokio::process::Command::new("/bin/sh");
+            cmd.args(["-c", "sleep 30"]);
+            cmd
+        }
+    }
 
     #[test]
     fn prepare_subprocess_for_appimage_no_appimage_is_safe() {

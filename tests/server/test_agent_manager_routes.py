@@ -251,6 +251,111 @@ class TestAgentManagerRoutes:
 
         assert allowed.status_code == 200
         assert allowed.json()["config"]["model"] == "local-model"
+        scheduler.register_agent.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("endpoint", "schedule_type"),
+        [
+            ("/v1/managed-agents", "interval"),
+            ("/v1/templates/scheduled/instantiate", "cron"),
+        ],
+    )
+    def test_template_schedule_uses_persisted_config(
+        self,
+        manager,
+        client,
+        endpoint,
+        schedule_type,
+    ):
+        template = {
+            "id": "scheduled",
+            "source": "user",
+            "model": "local-model",
+            "schedule_type": schedule_type,
+            "schedule_value": "0 9 * * *" if schedule_type == "cron" else 60,
+        }
+        scheduler = MagicMock()
+        client.app.state.model = "local-model"
+        client.app.state.agent_scheduler = scheduler
+        payload = {"name": "scheduled"}
+        if endpoint == "/v1/managed-agents":
+            payload["template_id"] = "scheduled"
+
+        with patch.object(manager, "list_templates", return_value=[template]):
+            response = client.post(endpoint, json=payload)
+
+        assert response.status_code == 200
+        agent = response.json()
+        assert agent["config"]["schedule_type"] == schedule_type
+        scheduler.register_agent.assert_called_once_with(agent["id"])
+
+    @pytest.mark.parametrize(
+        "model", ["openrouter/stealth/ox-alpha", "stealth/ox-alpha"]
+    )
+    def test_sendblue_bind_rejects_persisted_ox_before_side_effects(
+        self,
+        manager,
+        client,
+        model,
+    ):
+        agent = manager.create_agent(
+            name="persisted-ox",
+            config={"model": model},
+        )
+        client.app.state.model = "state-local"
+        client.app.state.engine = SimpleNamespace(_model="engine-local")
+
+        with patch("openjarvis.channels.sendblue.SendBlueChannel") as channel:
+            response = client.post(
+                f"/v1/managed-agents/{agent['id']}/channels",
+                json={
+                    "channel_type": "sendblue",
+                    "config": {
+                        "api_key_id": "key-id",
+                        "api_secret_key": "secret",
+                    },
+                },
+            )
+
+        assert response.status_code == 400
+        channel.assert_not_called()
+        assert manager.list_channel_bindings(agent["id"]) == []
+
+    def test_sendblue_bind_constructs_research_with_persisted_model(
+        self,
+        manager,
+        client,
+    ):
+        agent = manager.create_agent(
+            name="persisted-local",
+            config={"model": "persisted-local"},
+        )
+        client.app.state.model = "state-local"
+        client.app.state.engine = SimpleNamespace(_model="engine-local")
+
+        with (
+            patch("openjarvis.channels.sendblue.SendBlueChannel"),
+            patch(
+                "openjarvis.server.agent_manager_routes._build_deep_research_tools",
+                return_value=[MagicMock()],
+            ),
+            patch("openjarvis.agents.deep_research.DeepResearchAgent") as research,
+            patch("openjarvis.server.channel_bridge.ChannelBridge"),
+            patch("openjarvis.server.session_store.SessionStore"),
+        ):
+            response = client.post(
+                f"/v1/managed-agents/{agent['id']}/channels",
+                json={
+                    "channel_type": "sendblue",
+                    "config": {
+                        "api_key_id": "key-id",
+                        "api_secret_key": "secret",
+                    },
+                },
+            )
+
+        assert response.status_code == 200
+        assert research.call_args.kwargs["model"] == "persisted-local"
 
     def test_delete_agent(self, client):
         create_resp = client.post("/v1/managed-agents", json={"name": "doomed"})
